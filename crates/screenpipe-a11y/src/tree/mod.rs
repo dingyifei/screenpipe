@@ -490,6 +490,11 @@ pub struct TreeWalkerConfig {
     pub walk_timeout: Duration,
     /// Maximum text length to accumulate (default: 50_000 chars).
     pub max_text_length: usize,
+    /// Maximum bytes of text kept from a single node (default: 16 KiB).
+    /// Longer values keep their TAIL, starting at a line boundary: a terminal's
+    /// AXTextArea value is its whole scrollback, newest output last, and storing
+    /// it whole on every capture is what bloats `accessibility_tree_json`.
+    pub max_node_text_length: usize,
     /// Per-element AX IPC timeout (default: 200ms).
     pub element_timeout_secs: f32,
     /// User-configured windows to ignore (substring match on app name or window title).
@@ -567,6 +572,7 @@ impl Default for TreeWalkerConfig {
             max_nodes: 5000,
             walk_timeout: Duration::from_millis(250),
             max_text_length: 50_000,
+            max_node_text_length: 16 * 1024,
             element_timeout_secs: 0.2,
             ignored_windows: Vec::new(),
             included_windows: Vec::new(),
@@ -693,6 +699,42 @@ impl FocusedWindowFilterResult {
             && config.included_urls.is_empty()
             && matches!(self, Self::Allowed { .. })
     }
+}
+
+/// Keep at most `max_bytes` of the end of `text`, starting on a line boundary
+/// when one exists inside the kept window. Returns the kept slice and how many
+/// chars were dropped from the front (for shifting char-based `LineSpan`s).
+pub(crate) fn tail_cap_text(text: &str, max_bytes: usize) -> (&str, usize) {
+    if max_bytes == 0 || text.len() <= max_bytes {
+        return (text, 0);
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    if let Some(nl) = text[start..].find('\n') {
+        if start + nl + 1 < text.len() {
+            start += nl + 1;
+        }
+    }
+    (&text[start..], text[..start].chars().count())
+}
+
+/// Re-base line spans computed over the full text onto a tail-capped copy:
+/// spans that start in the dropped prefix are discarded, the rest shift left.
+pub(crate) fn shift_line_spans(spans: Vec<LineSpan>, dropped_chars: usize) -> Vec<LineSpan> {
+    if dropped_chars == 0 {
+        return spans;
+    }
+    let dropped = dropped_chars.min(u32::MAX as usize) as u32;
+    spans
+        .into_iter()
+        .filter(|s| s.char_start >= dropped)
+        .map(|mut s| {
+            s.char_start -= dropped;
+            s
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1508,5 +1550,43 @@ mod tests {
         );
         let json = serde_json::to_string(&node).expect("serialize");
         assert!(!json.contains("\"lines\""));
+    }
+
+    #[test]
+    fn tail_cap_keeps_short_text() {
+        assert_eq!(tail_cap_text("abc", 16), ("abc", 0));
+        assert_eq!(tail_cap_text("abc", 0), ("abc", 0));
+    }
+
+    #[test]
+    fn tail_cap_keeps_newest_lines_on_a_line_boundary() {
+        let text: String = (0..100_000).map(|i| format!("line {i}\n")).collect();
+        let (kept, dropped) = tail_cap_text(text.trim_end(), 16 * 1024);
+        assert!(kept.len() <= 16 * 1024);
+        assert!(kept.starts_with("line "));
+        assert!(kept.ends_with("line 99999"));
+        let full = text.trim_end();
+        assert_eq!(&full[full.len() - kept.len()..], kept);
+        assert_eq!(full.chars().count() - dropped, kept.chars().count());
+    }
+
+    #[test]
+    fn tail_cap_respects_char_boundaries() {
+        let text = "é".repeat(10_000); // 2 bytes each, no newlines
+        let (kept, dropped) = tail_cap_text(&text, 1001);
+        assert!(kept.len() <= 1001);
+        assert_eq!(dropped + kept.chars().count(), 10_000);
+    }
+
+    #[test]
+    fn shift_line_spans_drops_prefix_and_rebases() {
+        let b = NodeBounds { left: 0.0, top: 0.0, width: 1.0, height: 0.1 };
+        let spans = vec![
+            LineSpan { char_start: 0, char_count: 5, bounds: b.clone() },
+            LineSpan { char_start: 10, char_count: 5, bounds: b.clone() },
+            LineSpan { char_start: 25, char_count: 5, bounds: b },
+        ];
+        let out = shift_line_spans(spans, 10);
+        assert_eq!(out.iter().map(|s| s.char_start).collect::<Vec<_>>(), vec![0, 15]);
     }
 }

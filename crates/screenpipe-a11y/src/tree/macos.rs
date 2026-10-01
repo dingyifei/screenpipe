@@ -1191,6 +1191,8 @@ fn is_vscode_terminal_list_role(role_str: &str, depth: usize, app: &AppState) ->
 /// Mutable state passed through the recursive walk.
 struct WalkState {
     text_buffer: String,
+    /// `TreeWalkerConfig::max_node_text_length` — per-node tail cap.
+    max_node_text_length: usize,
     nodes: Vec<AccessibilityTreeNode>,
     node_count: usize,
     max_depth: usize,
@@ -1267,6 +1269,7 @@ impl WalkState {
             text_buffer: String::with_capacity(4096),
             nodes: Vec::with_capacity(256),
             node_count: 0,
+            max_node_text_length: config.max_node_text_length,
             max_depth: config.max_depth,
             max_nodes: config.effective_max_nodes(),
             walk_timeout: config.effective_walk_timeout(),
@@ -2199,8 +2202,10 @@ fn extract_text(
     if role_str == "AXTextField" || role_str == "AXTextArea" || role_str == "AXComboBox" {
         if let Some(val) = attrs.value.as_deref() {
             if !val.is_empty() {
-                append_text(&mut state.text_buffer, val);
-                let trimmed = val.trim().to_string();
+                let full = val.trim();
+                let (capped, dropped) = super::tail_cap_text(full, state.max_node_text_length);
+                append_text(&mut state.text_buffer, capped);
+                let trimmed = capped.to_string();
                 let mut node = AccessibilityTreeNode::new(
                     role_str.to_string(),
                     trimmed.clone(),
@@ -2216,8 +2221,11 @@ fn extract_text(
                 apply_primary_semantic_attrs(&mut node, attrs);
                 // AXTextArea is the multi-line case (textarea, rich text views);
                 // the gate naturally skips single-line AXTextField/AXComboBox.
+                // Lines are measured against the FULL value (AX ranges index
+                // into it), then re-based onto the capped copy.
                 if role_str == "AXTextArea" {
-                    node.lines = capture_lines_for_node(elem, &trimmed, &bounds, on_screen, state);
+                    node.lines = capture_lines_for_node(elem, full, &bounds, on_screen, state)
+                        .map(|spans| super::shift_line_spans(spans, dropped));
                 }
                 state.nodes.push(node);
                 return true;
@@ -2229,8 +2237,10 @@ fn extract_text(
     if role_str == "AXStaticText" {
         if let Some(val) = attrs.value.as_deref() {
             if !val.is_empty() {
-                append_text(&mut state.text_buffer, val);
-                let trimmed = val.trim().to_string();
+                let full = val.trim();
+                let (capped, dropped) = super::tail_cap_text(full, state.max_node_text_length);
+                append_text(&mut state.text_buffer, capped);
+                let trimmed = capped.to_string();
                 let mut node = AccessibilityTreeNode::new(
                     role_str.to_string(),
                     trimmed.clone(),
@@ -2243,7 +2253,8 @@ fn extract_text(
                 node.walk_index = state.node_count.min(u32::MAX as usize) as u32;
                 fill_ax_props(&mut node, elem, role_str, state.capture_semantic_structure);
                 apply_primary_semantic_attrs(&mut node, attrs);
-                node.lines = capture_lines_for_node(elem, &trimmed, &bounds, on_screen, state);
+                node.lines = capture_lines_for_node(elem, full, &bounds, on_screen, state)
+                    .map(|spans| super::shift_line_spans(spans, dropped));
                 state.nodes.push(node);
                 return true;
             }
