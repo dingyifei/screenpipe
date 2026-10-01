@@ -496,7 +496,7 @@ pub async fn handle_db_command(command: &DbCommand) -> Result<()> {
     let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
     if data_dir.join("storage.json").exists() {
         if matches!(command, DbCommand::Check) {
-            let db = screenpipe_db::DatabaseManager::new(
+            let db = screenpipe_db::DatabaseManager::new_for_verification(
                 data_dir
                     .join("db.sqlite")
                     .to_str()

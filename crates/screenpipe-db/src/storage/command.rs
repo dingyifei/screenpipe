@@ -41,13 +41,16 @@ pub async fn run_command(
         }
         "status" => serde_json::to_value(StorageDescriptor::read(root)?).map_err(storage_error),
         "verify" | "seal" | "reclaim" | "backup" => {
-            let db = DatabaseManager::new(
-                root.join("db.sqlite")
-                    .to_str()
-                    .ok_or_else(|| storage_error("non-UTF8 database path"))?,
-                Default::default(),
-            )
-            .await?;
+            let path = root
+                .join("db.sqlite")
+                .to_str()
+                .ok_or_else(|| storage_error("non-UTF8 database path"))?
+                .to_string();
+            let db = if command == "verify" {
+                DatabaseManager::new_for_verification(&path, Default::default()).await?
+            } else {
+                DatabaseManager::new(&path, Default::default()).await?
+            };
             let result = async {
                 match command {
                     "verify" => {

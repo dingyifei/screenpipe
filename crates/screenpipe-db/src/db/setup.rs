@@ -126,6 +126,20 @@ impl DatabaseManager {
         Self::new_with_storage(&resolved.to_string_lossy(), config, storage, false, true).await
     }
 
+    /// Like [`Self::new`] but with no background tasks (startup quick_check,
+    /// WAL maintenance, payload sealing/reclaim). Used by `db check` and
+    /// `storage verify`, which may run against a backup copy of the data dir:
+    /// with background tasks on, reclaim can republish and unlink payload
+    /// files inside the copy while it is being verified.
+    pub async fn new_for_verification(
+        database_path: &str,
+        config: DbConfig,
+    ) -> Result<Self, sqlx::Error> {
+        let resolved = crate::storage::resolve_database_path(Path::new(database_path))?;
+        let storage = crate::storage::HybridStorage::for_index(&resolved)?;
+        Self::new_with_storage(&resolved.to_string_lossy(), config, storage, false, false).await
+    }
+
     pub(crate) async fn new_with_storage(
         database_path: &str,
         config: DbConfig,
