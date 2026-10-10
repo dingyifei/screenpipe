@@ -157,6 +157,30 @@ pub struct RetranscribeChunkResult {
     pub segments: Vec<RetranscribeSegmentResult>,
 }
 
+/// Segments at least this long keep the pinned-language text without a second
+/// opinion: the forced translation shows up on short ones.
+const UNPINNED_RECHECK_MAX_SECS: f64 = 6.0;
+
+fn has_latin_letters(text: &str) -> bool {
+    text.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Letters present, none of them Latin (e.g. all Chinese).
+fn is_only_non_latin(text: &str) -> bool {
+    text.chars().any(char::is_alphabetic) && !has_latin_letters(text)
+}
+
+/// The pinned-language pass answered wholly outside Latin script while the
+/// unpinned pass, on the same audio, answered wholly in Latin script: the pin
+/// translated speech that was in the other language.
+fn pinned_language_flipped(pinned: &str, unpinned: &str) -> bool {
+    is_only_non_latin(pinned)
+        && has_latin_letters(unpinned)
+        && !unpinned
+            .chars()
+            .any(|c| c.is_alphabetic() && !c.is_ascii_alphabetic())
+}
+
 /// Transcribe one chunk segment by segment, with a speaker per segment.
 /// `None` means "fall back to one transcription for the whole chunk": no
 /// usable segments, or an STT failure part-way that would leave holes.
@@ -164,6 +188,9 @@ async fn transcribe_speaker_segments(
     state: &AppState,
     vad: Arc<Mutex<Box<dyn VadEngine + Send>>>,
     session: &mut screenpipe_audio::transcription::engine::TranscriptionSession,
+    mut unpinned_session: Option<
+        &mut screenpipe_audio::transcription::engine::TranscriptionSession,
+    >,
     samples: &[f32],
     sample_rate: u32,
     device_name: &str,
@@ -223,6 +250,25 @@ async fn transcribe_speaker_segments(
             continue;
         }
         let duration = (segment.end - segment.start).max(0.0);
+        // A pinned language keeps a long mixed-language chunk from being
+        // translated, but on a short segment it does the translating itself:
+        // "good enough" comes back as "够了". When a short segment comes back
+        // entirely in non-Latin script, ask again without the pin and keep that
+        // answer if it is entirely Latin, i.e. the two disagree on the language.
+        let text = match unpinned_session.as_deref_mut() {
+            Some(unpinned) if duration < UNPINNED_RECHECK_MAX_SECS && is_only_non_latin(&text) => {
+                match unpinned
+                    .transcribe(&segment.samples, segment.sample_rate, device_name)
+                    .await
+                {
+                    Ok(second) if pinned_language_flipped(&text, second.trim()) => {
+                        second.trim().to_string()
+                    }
+                    _ => text,
+                }
+            }
+            _ => text,
+        };
         let speaker_id = if segment.embedding.is_empty() {
             None
         } else {
@@ -564,6 +610,28 @@ pub async fn retranscribe_handler(
         }
     }
 
+    // A second engine with no language hint, for the per-segment speaker path
+    // (see `pinned_language_flipped`). Only needed when a language is pinned.
+    let unpinned_engine = if request.speakers && !languages.is_empty() {
+        TranscriptionEngine::new(
+            engine.clone(),
+            deepgram_config.clone(),
+            openai_compatible_config.clone(),
+            Vec::new(),
+            effective_vocabulary.clone(),
+        )
+        .await
+        .map_err(|e| {
+            warn!(
+                "retranscribe: no unpinned engine ({}), keeping pinned text",
+                e
+            )
+        })
+        .ok()
+    } else {
+        None
+    };
+
     // 3. Build unified TranscriptionEngine for this retranscription request
     let transcription_engine = match TranscriptionEngine::new(
         engine.clone(),
@@ -656,10 +724,14 @@ pub async fn retranscribe_handler(
         // Speaker path: one row per speech segment, each with its speaker.
         // Any failure falls through to the single-row path below.
         if let Some(vad) = speaker_vad.clone() {
+            let mut unpinned_session = unpinned_engine
+                .as_ref()
+                .and_then(|e| e.create_session().ok());
             if let Some(segments) = transcribe_speaker_segments(
                 &state,
                 vad,
                 &mut session,
+                unpinned_session.as_mut(),
                 &samples,
                 sample_rate,
                 device_name,
@@ -1247,6 +1319,35 @@ fn looks_like_capture_timestamp(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_language_flip_is_detected_only_on_a_full_script_swap() {
+        // The pin translated English speech: take the unpinned answer.
+        assert!(pinned_language_flipped("够了。", "Good enough."));
+        assert!(pinned_language_flipped(
+            "同源重组。",
+            "Homologous recombination."
+        ));
+        // Chinese speech: both passes answer in Chinese.
+        assert!(!pinned_language_flipped(
+            "还不错，还能识别。",
+            "还不错，还能识别。"
+        ));
+        // Mixed speech the pin kept as spoken: not a flip, never re-asked.
+        assert!(!is_only_non_latin("这个 feature 还需要 review"));
+        assert!(!pinned_language_flipped(
+            "这个 feature 还需要 review",
+            "This feature needs review"
+        ));
+        // Unpinned answer still has Chinese in it: keep the pinned text.
+        assert!(!pinned_language_flipped(
+            "现在测试中文识别。",
+            "Sure. 现在测试中文识别。"
+        ));
+        // Punctuation or digits only is not "non-Latin text".
+        assert!(!is_only_non_latin("。"));
+        assert!(!is_only_non_latin("123"));
+    }
 
     #[test]
     fn speakers_is_opt_in() {
