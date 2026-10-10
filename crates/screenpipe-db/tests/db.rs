@@ -1677,6 +1677,62 @@ mod tests {
         assert_eq!(speaker.unwrap().id, 1);
     }
 
+    fn voice(axis: usize) -> Vec<f32> {
+        let mut v = vec![0.01_f32; 512];
+        v[axis] = 1.0;
+        v
+    }
+
+    #[tokio::test]
+    async fn unnamed_speakers_only_match_on_their_own_day() {
+        use screenpipe_db::SpeakerEmbeddingMatch;
+        let db = setup_test_db().await;
+        let speaker = db.insert_speaker(&voice(3)).await.unwrap();
+
+        // Created today: a candidate today.
+        assert!(matches!(
+            db.match_speaker_from_embedding(&voice(3)).await.unwrap(),
+            SpeakerEmbeddingMatch::Matched(s) if s.id == speaker.id
+        ));
+        // Not a candidate on any other day.
+        assert!(matches!(
+            db.match_speaker_from_embedding_on(&voice(3), "1999-01-01")
+                .await
+                .unwrap(),
+            SpeakerEmbeddingMatch::NoMatch
+        ));
+    }
+
+    #[tokio::test]
+    async fn named_speakers_match_across_days() {
+        use screenpipe_db::SpeakerEmbeddingMatch;
+        let db = setup_test_db().await;
+        let speaker = db.insert_speaker(&voice(7)).await.unwrap();
+        db.update_speaker_name(speaker.id, "Alice").await.unwrap();
+
+        assert!(matches!(
+            db.match_speaker_from_embedding_on(&voice(7), "1999-01-01")
+                .await
+                .unwrap(),
+            SpeakerEmbeddingMatch::Matched(s) if s.id == speaker.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn unnamed_speakers_without_a_day_stamp_are_never_candidates() {
+        use screenpipe_db::SpeakerEmbeddingMatch;
+        let db = setup_test_db().await;
+        let speaker = db.insert_speaker(&voice(11)).await.unwrap();
+        // Rows from before day-scoping carry no stamp (or arbitrary metadata).
+        for stale in ["", "not json"] {
+            db.update_speaker_metadata(speaker.id, stale).await.unwrap();
+            assert!(matches!(
+                db.match_speaker_from_embedding(&voice(11)).await.unwrap(),
+                SpeakerEmbeddingMatch::NoMatch
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn test_update_speaker_metadata() {
         let db = setup_test_db().await;
