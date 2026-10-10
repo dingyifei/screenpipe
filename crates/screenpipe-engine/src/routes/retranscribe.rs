@@ -161,6 +161,27 @@ pub struct RetranscribeChunkResult {
 /// opinion: the forced translation shows up on short ones.
 const UNPINNED_RECHECK_MAX_SECS: f64 = 6.0;
 
+/// Segments shorter than this are dropped when their text is only a filler.
+const FILLER_ONLY_MAX_SECS: f64 = 1.0;
+
+/// Nothing but hesitation sounds once punctuation and spaces are removed:
+/// "嗯。", "啊", "Uh.", "mm hmm".
+fn is_filler_only(text: &str) -> bool {
+    const LATIN_FILLERS: [&str; 12] = [
+        "uh", "um", "uhm", "hm", "hmm", "mm", "mhm", "ah", "oh", "eh", "er", "ja",
+    ];
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    !words.is_empty()
+        && words.iter().all(|w| {
+            LATIN_FILLERS.contains(&w.as_str())
+                || w.chars().all(|c| "嗯啊呃哦噢唔唉诶额哎".contains(c))
+        })
+}
+
 fn has_latin_letters(text: &str) -> bool {
     text.chars().any(|c| c.is_ascii_alphabetic())
 }
@@ -269,6 +290,11 @@ async fn transcribe_speaker_segments(
             }
             _ => text,
         };
+        // A sub-second segment that is nothing but a filler is almost always
+        // the model answering noise or a breath, not a word worth a row.
+        if duration < FILLER_ONLY_MAX_SECS && is_filler_only(&text) {
+            continue;
+        }
         let speaker_id = if segment.embedding.is_empty() {
             None
         } else {
@@ -1347,6 +1373,25 @@ mod tests {
         // Punctuation or digits only is not "non-Latin text".
         assert!(!is_only_non_latin("。"));
         assert!(!is_only_non_latin("123"));
+    }
+
+    #[test]
+    fn filler_only_text_is_recognized() {
+        for filler in ["嗯。", "啊", "呃。", "嗯嗯", "Uh.", "um", "Mm hmm.", "ja"] {
+            assert!(is_filler_only(filler), "{filler}");
+        }
+        for speech in [
+            "是。",
+            "And.",
+            "like。",
+            "嗯，我也是",
+            "Uh, wait",
+            "",
+            "。",
+            "thing.",
+        ] {
+            assert!(!is_filler_only(speech), "{speech}");
+        }
     }
 
     #[test]
