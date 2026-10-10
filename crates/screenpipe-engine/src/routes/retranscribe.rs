@@ -206,11 +206,15 @@ fn pinned_language_flipped(pinned: &str, unpinned: &str) -> bool {
 }
 
 /// How far apart the files of two microphones may place the same sound. File
-/// times are stamped loosely (a recording's later files run about 2 s late),
-/// and a Bluetooth mic trails a built-in one.
-const OTHER_MIC_LAG_SECS: f64 = 3.0;
-/// Files of another mic starting this close to a chunk can overlap it.
-const OTHER_MIC_WINDOW_SECS: i64 = 32;
+/// times are stamped loosely: a recording's later files run about 2 s late
+/// while its first does not, and a mic that joins mid-session starts with a
+/// first file. 3.5 s was measured between a built-in mic and AirPods.
+const OTHER_MIC_LAG_SECS: f64 = 6.0;
+/// Files of another mic starting this close to a chunk can overlap it, lag included.
+const OTHER_MIC_WINDOW_SECS: i64 = 40;
+/// Two files of one device this far apart, start to start, are one recording
+/// continued; their audio is joined so a sentence across them can be found.
+const SAME_RECORDING_GAP_SECS: std::ops::RangeInclusive<f64> = 25.0..=35.0;
 /// Decoded files of other mics kept across the chunks of one request.
 const OTHER_MIC_FILES_KEPT: usize = 6;
 /// Audio taken either side of the matching span when asking what the other mic heard.
@@ -232,7 +236,7 @@ async fn other_mic_files(
     cache: &mut std::collections::VecDeque<Arc<OtherMicFile>>,
     chunk: &AudioChunkInfo,
     device_name: &str,
-) -> Vec<(f64, Arc<OtherMicFile>)> {
+) -> Vec<(f64, OtherMicAudio)> {
     let window = chrono::Duration::seconds(OTHER_MIC_WINDOW_SECS);
     let nearby = match state
         .db
@@ -248,7 +252,8 @@ async fn other_mic_files(
             return Vec::new();
         }
     };
-    let mut files = Vec::new();
+    // Per other device, its files in time order.
+    let mut files: std::collections::BTreeMap<String, Vec<Arc<OtherMicFile>>> = Default::default();
     let mut seen = HashSet::new();
     for other in &nearby {
         let device = retranscribe_chunk_device(other);
@@ -287,10 +292,41 @@ async fn other_mic_files(
                 file
             }
         };
-        let starts_after = (file.timestamp - chunk.timestamp).num_milliseconds() as f64 / 1000.0;
-        files.push((starts_after, file));
+        files.entry(device.name).or_default().push(file);
     }
-    files
+    let secs_between = |a: DateTime<Utc>, b: DateTime<Utc>| (b - a).num_milliseconds() as f64 / 1000.0;
+    let mut runs: Vec<(f64, OtherMicAudio)> = Vec::new();
+    for (other_device, mut device_files) in files {
+        device_files.sort_by_key(|f| f.timestamp);
+        let mut previous: Option<DateTime<Utc>> = None;
+        for file in device_files {
+            let continues =
+                previous.is_some_and(|p| SAME_RECORDING_GAP_SECS.contains(&secs_between(p, file.timestamp)));
+            previous = Some(file.timestamp);
+            match runs.last_mut() {
+                Some((_, run)) if continues => {
+                    run.samples_16k.extend_from_slice(&file.samples_16k);
+                    run.levels.extend_from_slice(&file.levels);
+                }
+                _ => runs.push((
+                    secs_between(chunk.timestamp, file.timestamp),
+                    OtherMicAudio {
+                        device_name: other_device.clone(),
+                        samples_16k: file.samples_16k.clone(),
+                        levels: file.levels.clone(),
+                    },
+                )),
+            }
+        }
+    }
+    runs
+}
+
+/// One stretch of another microphone's recording: one file, or consecutive files joined.
+struct OtherMicAudio {
+    device_name: String,
+    samples_16k: Vec<f32>,
+    levels: Vec<f32>,
 }
 
 /// The audio of another microphone that carries `[start, end]` (seconds into
@@ -299,7 +335,8 @@ fn louder_mic_audio(
     levels: &[f32],
     start: f64,
     end: f64,
-    others: &[(f64, Arc<OtherMicFile>)],
+    device_name: &str,
+    others: &[(f64, OtherMicAudio)],
 ) -> Option<Vec<f32>> {
     use screenpipe_audio::same_utterance::{louder_copy_at, ENVELOPE_FPS};
     let fps = ENVELOPE_FPS as f64;
@@ -311,6 +348,8 @@ fn louder_mic_audio(
             &file.levels,
             (-starts_after * fps).round() as i64,
             (OTHER_MIC_LAG_SECS * fps) as usize,
+            // Level mics: the one whose name sorts first keeps the line.
+            device_name < file.device_name.as_str(),
         )?;
         let per_frame = 16000 / ENVELOPE_FPS;
         let pad = (OTHER_MIC_TEXT_PAD_SECS * fps) as usize;
@@ -338,7 +377,7 @@ async fn transcribe_speaker_segments(
     device_name: &str,
     is_output_device: bool,
     chunk_id: i64,
-    other_mics: &[(f64, Arc<OtherMicFile>)],
+    other_mics: &[(f64, OtherMicAudio)],
 ) -> Option<Vec<RetranscribeSegmentResult>> {
     let resampled;
     let samples_16k: &[f32] = if sample_rate == 16000 {
@@ -427,7 +466,7 @@ async fn transcribe_speaker_segments(
         // cover these, this segment is that sentence again: the louder mic
         // keeps it. Decided before the speaker lookup, so the copy neither
         // creates nor trains a per-microphone speaker.
-        if let Some(theirs) = louder_mic_audio(&levels, segment.start, segment.end, other_mics) {
+        if let Some(theirs) = louder_mic_audio(&levels, segment.start, segment.end, device_name, other_mics) {
             match session.transcribe(&theirs, 16000, device_name).await {
                 Ok(their_text)
                     if screenpipe_audio::same_utterance::text_covered(&text, &their_text) =>

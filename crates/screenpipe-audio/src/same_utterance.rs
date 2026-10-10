@@ -24,16 +24,18 @@ pub const ENVELOPE_FPS: usize = 50;
 /// Envelope floor, dBFS. Digital silence and missing audio sit here.
 pub const FLOOR_DB: f32 = -70.0;
 
-/// A frame above this carries something; about the level of a quiet room mic.
-const VOICED_DB: f32 = -50.0;
+/// A span whose loud parts stay under this holds nothing to compare.
+const SILENT_DB: f32 = -55.0;
 /// Envelopes of one sound on two mics correlate at a median 0.85 (measured on
 /// 70 file pairs of a laptop mic and AirPods); unrelated speech passes 0.6
 /// under 2 % of the time.
 const MIN_CORRELATION: f32 = 0.6;
-/// The other mic must carry sound on this share of the frames where this one does.
-const MIN_COVERAGE: f32 = 0.8;
-/// And be this much louder, so of two copies exactly one is the duplicate.
-const MIN_LOUDER_DB: f32 = 3.0;
+/// The other mic must be louder by this much for this one to be the duplicate.
+/// Small on purpose: AirPods measured only 3 to 4 dB above a laptop mic for
+/// the wearer's own voice. Inside the margin the two count as level, and
+/// `wins_ties` decides, so that of two copies at most one calls itself the
+/// duplicate.
+const LOUDER_MARGIN_DB: f32 = 1.0;
 /// Spans shorter than this are widened: a correlation over a few frames means little.
 const MIN_SPAN_FRAMES: usize = 2 * ENVELOPE_FPS;
 /// Share of this line's character pairs that must appear in the other mic's text.
@@ -62,13 +64,20 @@ pub fn frame_db(frame: &[f32]) -> f32 {
 /// `offset`); up to `max_lag` frames either side of it are tried, which is
 /// what absorbs a Bluetooth mic's delay and loosely stamped files. A short
 /// span is widened inside `mine` first. A candidate must lie wholly inside
-/// `other`: a span cut off by the end of a file is left alone.
+/// `other`: a span cut off by the end of a recording is left alone.
+///
+/// Loudness is compared on the loud parts (the 90th percentile of each side),
+/// because a headset mic gates the gaps between syllables to silence while a
+/// room mic keeps its noise floor there. `wins_ties` says which side keeps the
+/// line when the two are level; the two mics of a pair must be given opposite
+/// values, e.g. by comparing their names.
 pub fn louder_copy_at(
     mine: &[f32],
     span: (usize, usize),
     other: &[f32],
     offset: i64,
     max_lag: usize,
+    wins_ties: bool,
 ) -> Option<usize> {
     let (mut from, mut to) = (span.0.min(mine.len()), span.1.min(mine.len()));
     if to <= from {
@@ -80,10 +89,8 @@ pub fn louder_copy_at(
         to = (to + grow).min(mine.len());
     }
     let window = &mine[from..to];
-    let voiced: Vec<usize> = (0..window.len())
-        .filter(|&i| window[i] > VOICED_DB)
-        .collect();
-    if voiced.is_empty() {
+    let my_level = loud_level(window);
+    if my_level < SILENT_DB {
         return None;
     }
 
@@ -103,14 +110,8 @@ pub fn louder_copy_at(
     if r < MIN_CORRELATION {
         return None;
     }
-    let theirs = &other[start..start + window.len()];
-    let covered = voiced.iter().filter(|&&i| theirs[i] > VOICED_DB).count();
-    if (covered as f32) < MIN_COVERAGE * voiced.len() as f32 {
-        return None;
-    }
-    let louder_by = median(voiced.iter().map(|&i| theirs[i]).collect())
-        - median(voiced.iter().map(|&i| window[i]).collect());
-    if louder_by < MIN_LOUDER_DB {
+    let louder_by = loud_level(&other[start..start + window.len()]) - my_level;
+    if louder_by < -LOUDER_MARGIN_DB || (louder_by < LOUDER_MARGIN_DB && wins_ties) {
         return None;
     }
     // Back from the widened window to the caller's own span.
@@ -133,9 +134,11 @@ fn correlation(a: &[f32], b: &[f32]) -> f32 {
     cov / (var_a * var_b).sqrt()
 }
 
-fn median(mut values: Vec<f32>) -> f32 {
-    values.sort_by(|a, b| a.total_cmp(b));
-    values[values.len() / 2]
+/// Level of the loud parts of an envelope: its 90th percentile.
+fn loud_level(levels: &[f32]) -> f32 {
+    let mut sorted = levels.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted[(sorted.len() * 9 / 10).min(sorted.len() - 1)]
 }
 
 /// The words of `mine` are among the words of `other`: at least
@@ -213,50 +216,71 @@ mod tests {
     fn finds_a_louder_delayed_copy() {
         let mine = speech(1, 300);
         let other = shifted(&mine, 9, 8.0);
-        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 0, 25), Some(59));
+        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 0, 25, false), Some(59));
     }
 
     #[test]
     fn the_louder_copy_is_not_the_duplicate() {
         let loud = speech(1, 300);
         let quiet = shifted(&loud, 9, -8.0);
-        assert_eq!(louder_copy_at(&loud, (50, 250), &quiet, 0, 25), None);
+        assert_eq!(louder_copy_at(&loud, (50, 250), &quiet, 0, 25, false), None);
+    }
+
+    #[test]
+    fn level_copies_are_settled_by_the_tie_rule() {
+        let mine = speech(1, 300);
+        let other = shifted(&mine, 9, 0.4);
+        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 0, 25, true), None);
+        assert_eq!(
+            louder_copy_at(&mine, (50, 250), &other, 0, 25, false),
+            Some(59)
+        );
+    }
+
+    #[test]
+    fn a_headset_that_gates_its_gaps_is_still_the_louder_copy() {
+        // The room mic keeps a noise floor between syllables; the headset goes silent there.
+        let headset = speech(1, 300);
+        let room: Vec<f32> = headset.iter().map(|v| (v - 4.0).max(-44.0)).collect();
+        let gated: Vec<f32> = headset.iter().map(|&v| if v < -50.0 { FLOOR_DB } else { v }).collect();
+        assert_eq!(louder_copy_at(&room, (50, 250), &gated, 0, 25, false), Some(50));
+        assert_eq!(louder_copy_at(&gated, (50, 250), &room, 0, 25, true), None);
     }
 
     #[test]
     fn different_speech_is_not_a_copy() {
         let mine = speech(1, 300);
         let other = shifted(&speech(2, 300), 0, 8.0);
-        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 0, 25), None);
+        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 0, 25, false), None);
     }
 
     #[test]
     fn a_delay_beyond_the_search_is_not_found() {
         let mine = speech(1, 300);
         let other = shifted(&mine, 60, 8.0);
-        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 0, 25), None);
-        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 60, 25), Some(110));
+        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 0, 25, false), None);
+        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 60, 25, false), Some(110));
     }
 
     #[test]
     fn a_short_span_is_judged_with_its_surroundings() {
         let mine = speech(3, 400);
         let other = shifted(&mine, 4, 6.0);
-        assert_eq!(louder_copy_at(&mine, (200, 215), &other, 0, 25), Some(204));
+        assert_eq!(louder_copy_at(&mine, (200, 215), &other, 0, 25, false), Some(204));
     }
 
     #[test]
     fn a_span_running_off_the_other_file_is_left_alone() {
         let mine = speech(1, 300);
         let other = shifted(&mine, 0, 8.0);
-        assert_eq!(louder_copy_at(&mine, (150, 300), &other[..200], 0, 25), None);
+        assert_eq!(louder_copy_at(&mine, (150, 300), &other[..200], 0, 25, false), None);
     }
 
     #[test]
     fn silence_is_never_a_copy() {
         let mine = vec![FLOOR_DB; 300];
         let other = shifted(&speech(1, 300), 0, 8.0);
-        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 0, 25), None);
+        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 0, 25, false), None);
     }
 
     #[test]
