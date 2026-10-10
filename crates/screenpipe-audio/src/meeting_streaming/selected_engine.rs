@@ -416,11 +416,18 @@ async fn transcribe_chunk(
         stream_id, device_type, chunk.captured_at_unix_ms, sequence
     );
     let captured_at = captured_at_from_ms(chunk.captured_at_unix_ms);
-    let speaker_name = if device_type == "input" {
+    // Who is speaking, by voice. A named match replaces the device-based
+    // label; an unnamed one keeps it and is announced by id alone.
+    let voice = super::live_speaker::identify(&chunk.samples).await;
+    let device_speaker_name = if device_type == "input" {
         config.local_speaker_name.clone()
     } else {
         None
     };
+    let speaker_name = voice
+        .as_ref()
+        .and_then(|v| v.name.clone())
+        .or(device_speaker_name);
 
     let delta = MeetingTranscriptDelta {
         meeting_id,
@@ -441,7 +448,7 @@ async fn transcribe_chunk(
         provider: config.provider.as_str().to_string(),
         model,
         stream_id: stream_id.to_string(),
-        item_id,
+        item_id: item_id.clone(),
         device_name: device_name.to_string(),
         device_type: device_type.to_string(),
         session_speaker_id: live_session_speaker_id(
@@ -454,6 +461,19 @@ async fn transcribe_chunk(
         captured_at,
     };
     let _ = screenpipe_events::send_event("meeting_transcript_final", final_event);
+    if let Some(voice) = voice {
+        let _ = screenpipe_events::send_event(
+            super::live_speaker::MEETING_TRANSCRIPT_SPEAKER_EVENT,
+            super::live_speaker::MeetingTranscriptSpeaker {
+                meeting_id,
+                item_id,
+                device_name: device_name.to_string(),
+                device_type: device_type.to_string(),
+                speaker_id: voice.id,
+                speaker_name: voice.name,
+            },
+        );
+    }
 
     Ok(())
 }
