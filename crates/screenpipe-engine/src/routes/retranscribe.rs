@@ -204,7 +204,9 @@ fn pinned_language_flipped(pinned: &str, unpinned: &str) -> bool {
 
 /// Transcribe one chunk segment by segment, with a speaker per segment.
 /// `None` means "fall back to one transcription for the whole chunk": no
-/// usable segments, or an STT failure part-way that would leave holes.
+/// segments found, or an STT failure part-way that would leave holes. An empty
+/// list means it ran and nothing was worth keeping (every segment came back
+/// empty or as a filler).
 async fn transcribe_speaker_segments(
     state: &AppState,
     vad: Arc<Mutex<Box<dyn VadEngine + Send>>>,
@@ -322,18 +324,17 @@ async fn transcribe_speaker_segments(
             text,
         });
     }
-    if results.is_empty() {
-        None
-    } else {
-        Some(results)
-    }
+    Some(results)
 }
 
 #[derive(Debug, Serialize)]
 pub struct RetranscribeResponse {
     pub chunks_processed: usize,
-    /// Chunks left untouched because VAD found no speech in them.
+    /// Chunks left untouched because VAD found no speech in them, plus chunks
+    /// whose speaker segments were all dropped (their old rows are deleted).
     pub chunks_skipped_silent: usize,
+    /// Chunks that had speech but could not be transcribed or stored.
+    pub chunks_failed: Vec<i64>,
     pub transcriptions: Vec<RetranscribeChunkResult>,
 }
 
@@ -586,6 +587,7 @@ pub async fn retranscribe_handler(
         return JsonResponse(json!({
             "chunks_processed": 0,
             "chunks_skipped_silent": 0,
+            "chunks_failed": [],
             "transcriptions": []
         }))
         .into_response();
@@ -685,6 +687,7 @@ pub async fn retranscribe_handler(
     let mut results = Vec::new();
     let mut processed = 0;
     let mut skipped_silent = 0;
+    let mut failed = Vec::new();
 
     // Deduplicate chunks by ID (multiple transcription rows per chunk)
     let mut seen_ids = std::collections::HashSet::new();
@@ -717,7 +720,13 @@ pub async fn retranscribe_handler(
             continue;
         }
 
-        let is_output_device = !chunk.is_input_device.unwrap_or(false);
+        // The joined transcription row is absent for a chunk never transcribed
+        // and may itself hold an earlier wrong answer; the file name is what
+        // the recorder wrote.
+        let device = retranscribe_chunk_device(chunk);
+        let device_name = device.name.as_str();
+        let is_input = device.is_input;
+        let is_output_device = !is_input;
         if silence_gate
             .is_silent(
                 &samples,
@@ -736,19 +745,19 @@ pub async fn retranscribe_handler(
             Ok(s) => s,
             Err(e) => {
                 error!("failed to create transcription session: {}", e);
+                failed.push(chunk.id);
                 continue;
             }
         };
 
-        let device_name = chunk.device.as_deref().unwrap_or("unknown");
         let old_text = chunk.transcription.clone();
-        let is_input = chunk.is_input_device.unwrap_or(false);
         let engine_name = engine.to_string();
         let timestamp = chunk.timestamp;
         let duration_secs = samples.len() as f64 / sample_rate as f64;
 
         // Speaker path: one row per speech segment, each with its speaker.
-        // Any failure falls through to the single-row path below.
+        // Any failure falls through to the single-row path below; an empty
+        // list is a result, and clears the chunk.
         if let Some(vad) = speaker_vad.clone() {
             let mut unpinned_session = unpinned_engine
                 .as_ref()
@@ -766,6 +775,22 @@ pub async fn retranscribe_handler(
             )
             .await
             {
+                if segments.is_empty() {
+                    if let Err(e) = state
+                        .db
+                        .clear_audio_transcriptions_as_silent(chunk.id)
+                        .await
+                    {
+                        error!(
+                            "failed to clear transcription for chunk {}: {}",
+                            chunk.id, e
+                        );
+                        failed.push(chunk.id);
+                        continue;
+                    }
+                    skipped_silent += 1;
+                    continue;
+                }
                 let rows: Vec<screenpipe_db::ReplacementAudioTranscription> = segments
                     .iter()
                     .map(|s| screenpipe_db::ReplacementAudioTranscription {
@@ -791,6 +816,7 @@ pub async fn retranscribe_handler(
                         "failed to update transcription for chunk {}: {}",
                         chunk.id, e
                     );
+                    failed.push(chunk.id);
                     continue;
                 }
                 results.push(RetranscribeChunkResult {
@@ -812,6 +838,7 @@ pub async fn retranscribe_handler(
             Ok(text) => text,
             Err(e) => {
                 error!("STT failed for chunk {}: {}", chunk.id, e);
+                failed.push(chunk.id);
                 continue;
             }
         };
@@ -835,6 +862,7 @@ pub async fn retranscribe_handler(
                 "failed to update transcription for chunk {}: {}",
                 chunk.id, e
             );
+            failed.push(chunk.id);
             continue;
         }
 
@@ -848,15 +876,17 @@ pub async fn retranscribe_handler(
     }
 
     info!(
-        "retranscribe complete: {} chunks processed, {} skipped as silent, {} transcription results",
+        "retranscribe complete: {} chunks processed, {} skipped as silent, {} failed, {} transcription results",
         processed,
         skipped_silent,
+        failed.len(),
         results.len()
     );
 
     let response = RetranscribeResponse {
         chunks_processed: processed,
         chunks_skipped_silent: skipped_silent,
+        chunks_failed: failed,
         transcriptions: results,
     };
     JsonResponse(json!(response)).into_response()
@@ -1291,6 +1321,19 @@ fn chunk_device(chunk: &AudioChunkInfo) -> ChunkDevice {
     ChunkDevice { name, is_input }
 }
 
+/// Device and direction for the chunk retranscribe route: from the file name
+/// (`<Device Name> (input|output)_<timestamp>.mp4`), and from the joined
+/// transcription row only when the name carries no direction.
+fn retranscribe_chunk_device(chunk: &AudioChunkInfo) -> ChunkDevice {
+    if chunk.file_path.contains(" (input)_") || chunk.file_path.contains(" (output)_") {
+        return extract_device_from_path(&chunk.file_path);
+    }
+    ChunkDevice {
+        name: chunk.device.as_deref().unwrap_or("unknown").to_string(),
+        is_input: chunk.is_input_device.unwrap_or(false),
+    }
+}
+
 fn extract_device_from_path(file_path: &str) -> ChunkDevice {
     let filename = StdPath::new(file_path)
         .file_stem()
@@ -1452,6 +1495,79 @@ mod tests {
             ChunkDevice {
                 name: "MacBook Pro Microphone".to_string(),
                 is_input: true,
+            }
+        );
+    }
+
+    #[test]
+    fn extracts_device_from_names_with_parentheses_and_underscores() {
+        for (path, name, is_input) in [
+            (
+                "/data/Yifei's AirPods Pro (input)_2026-10-10_14-22-54.mp4",
+                "Yifei's AirPods Pro",
+                true,
+            ),
+            (
+                "/data/System Audio (output)_2026-10-10_14-22-54.mp4",
+                "System Audio",
+                false,
+            ),
+            (
+                "/data/LG HDR 4K (HDMI) (output)_2026-10-10_14-22-54.mp4",
+                "LG HDR 4K (HDMI)",
+                false,
+            ),
+            (
+                "/data/USB_Audio_2 (input)_2026-10-10_14-22-54.mp4",
+                "USB_Audio_2",
+                true,
+            ),
+        ] {
+            assert_eq!(
+                extract_device_from_path(path),
+                ChunkDevice {
+                    name: name.to_string(),
+                    is_input,
+                },
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn retranscribe_device_comes_from_the_path_not_the_stored_row() {
+        // A mic chunk an earlier pass stored as `unknown`, output.
+        let mut stored = chunk(
+            1,
+            "/data/Yifei's AirPods Pro (input)_2026-10-10_14-22-54.mp4",
+            0,
+        );
+        stored.device = Some("unknown".to_string());
+        stored.is_input_device = Some(false);
+        assert_eq!(
+            retranscribe_chunk_device(&stored),
+            ChunkDevice {
+                name: "Yifei's AirPods Pro".to_string(),
+                is_input: true,
+            }
+        );
+
+        // No direction in the name: the stored row is all there is.
+        let mut unnamed = chunk(2, "/data/recording.mp4", 0);
+        unnamed.device = Some("Mic".to_string());
+        unnamed.is_input_device = Some(true);
+        assert_eq!(
+            retranscribe_chunk_device(&unnamed),
+            ChunkDevice {
+                name: "Mic".to_string(),
+                is_input: true,
+            }
+        );
+        assert_eq!(
+            retranscribe_chunk_device(&chunk(3, "/data/recording.mp4", 0)),
+            ChunkDevice {
+                name: "unknown".to_string(),
+                is_input: false,
             }
         );
     }
