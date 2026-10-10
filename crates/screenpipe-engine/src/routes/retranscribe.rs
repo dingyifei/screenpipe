@@ -359,11 +359,121 @@ fn louder_mic_audio(
     })
 }
 
+/// A segment ending this close to the end of its file, or starting this close
+/// to the start, is a sentence the 30-second file boundary cut in two.
+const BOUNDARY_SECS: f64 = 0.3;
+/// How much of the next file is looked at for the rest of such a sentence.
+const NEXT_HEAD_SECS: usize = 12;
+/// A joined sentence is at most this long, so a monologue is not chained on.
+const JOINED_MAX_SECS: f64 = 30.0;
+/// Where the next file of a recording starts, counted from this file's start.
+/// A recording's first file is stamped on time and later ones about 2 s late.
+const NEXT_FILE_SECS: std::ops::RangeInclusive<i64> = 25..=35;
+/// Slack when deciding whether a segment lies inside what the previous file
+/// already holds; segment edges move a little between passes.
+const COVERED_SLACK_SECS: f64 = 0.5;
+
+/// What to do with a segment of a file whose first `covered` seconds were
+/// already transcribed as the end of a sentence stored on the previous file.
+#[derive(Debug, PartialEq)]
+enum HeadSegment {
+    Keep,
+    /// Wholly inside the covered part.
+    Skip,
+    /// Starts inside it and runs on: transcribe from this many seconds into the segment.
+    TrimStart(f64),
+}
+
+fn head_segment(start: f64, end: f64, covered: f64) -> HeadSegment {
+    if covered <= 0.0 || start >= covered - COVERED_SLACK_SECS {
+        HeadSegment::Keep
+    } else if end <= covered + COVERED_SLACK_SECS {
+        HeadSegment::Skip
+    } else {
+        HeadSegment::TrimStart(covered - start)
+    }
+}
+
+/// The file of the same device that continues (`forward`) or precedes this chunk's recording.
+async fn neighbour_chunk(
+    state: &AppState,
+    chunk: &AudioChunkInfo,
+    device_name: &str,
+    forward: bool,
+) -> Option<AudioChunkInfo> {
+    let (near, far) = (
+        chrono::Duration::seconds(*NEXT_FILE_SECS.start()),
+        chrono::Duration::seconds(*NEXT_FILE_SECS.end()),
+    );
+    let (from, to) = if forward {
+        (chunk.timestamp + near, chunk.timestamp + far)
+    } else {
+        (chunk.timestamp - far, chunk.timestamp - near)
+    };
+    let nearby = state.db.get_audio_chunks_in_range(from, to).await.ok()?;
+    nearby.into_iter().find(|other| {
+        let device = retranscribe_chunk_device(other);
+        other.id != chunk.id && device.name == device_name
+    })
+}
+
+/// How many seconds at the start of this chunk the previous file's rows
+/// already hold, because a sentence was joined across the boundary and stored
+/// there. 0 when nothing was.
+async fn covered_by_previous(state: &AppState, chunk: &AudioChunkInfo, device_name: &str) -> f64 {
+    let Some(previous) = neighbour_chunk(state, chunk, device_name, false).await else {
+        return 0.0;
+    };
+    let last_end = match state.db.audio_transcription_max_end_time(previous.id).await {
+        // Nothing can overhang a 30 s file from here; skip decoding it.
+        Ok(Some(end)) if end > 25.0 => end,
+        _ => return 0.0,
+    };
+    let Ok((samples, sample_rate)) =
+        screenpipe_audio::utils::ffmpeg::read_audio_from_file(StdPath::new(&previous.file_path))
+    else {
+        return 0.0;
+    };
+    (last_end - samples.len() as f64 / sample_rate as f64).max(0.0)
+}
+
+/// The first seconds of the file that continues this chunk's recording, at 16 kHz.
+async fn next_file_head(state: &AppState, chunk: &AudioChunkInfo, device_name: &str) -> Option<Vec<f32>> {
+    let next = neighbour_chunk(state, chunk, device_name, true).await?;
+    let (samples, sample_rate) =
+        screenpipe_audio::utils::ffmpeg::read_audio_from_file(StdPath::new(&next.file_path)).ok()?;
+    let head = &samples[..samples.len().min(NEXT_HEAD_SECS * sample_rate as usize)];
+    if sample_rate == 16000 {
+        Some(head.to_vec())
+    } else {
+        screenpipe_audio::resample(head, sample_rate, 16000).ok()
+    }
+}
+
+/// The stored speaker a voice matches, without creating or updating one.
+async fn known_speaker(state: &AppState, embedding: &[f32]) -> Option<i64> {
+    if embedding.is_empty() {
+        return None;
+    }
+    match state.db.match_speaker_from_embedding(embedding).await {
+        Ok(screenpipe_db::SpeakerEmbeddingMatch::Matched(speaker)) => Some(speaker.id),
+        _ => None,
+    }
+}
+
 /// Transcribe one chunk segment by segment, with a speaker per segment.
 /// `None` means "fall back to one transcription for the whole chunk": no
 /// segments found, or an STT failure part-way that would leave holes. An empty
 /// list means it ran and nothing was worth keeping (every segment came back
 /// empty or as a filler, or was another microphone's sentence again).
+///
+/// A sentence the end of the file cut in two is transcribed whole: when the
+/// last segment runs to the end and the next file of the recording opens with
+/// speech (same voice, or one of the two unidentified), the two pieces are
+/// joined, transcribed once and stored here, with an end time past this
+/// file's length. That overhang is how the next file knows: its first
+/// `covered` seconds are skipped when it is processed. Each half alone gave
+/// the model a sentence with no beginning or no end.
 #[allow(clippy::too_many_arguments)]
 async fn transcribe_speaker_segments(
     state: &AppState,
@@ -378,6 +488,7 @@ async fn transcribe_speaker_segments(
     is_output_device: bool,
     chunk_id: i64,
     other_mics: &[(f64, OtherMicAudio)],
+    chunk: &AudioChunkInfo,
 ) -> Option<Vec<RetranscribeSegmentResult>> {
     let resampled;
     let samples_16k: &[f32] = if sample_rate == 16000 {
@@ -397,9 +508,11 @@ async fn transcribe_speaker_segments(
             }
         }
     };
+    let covered = covered_by_previous(state, chunk, device_name).await;
+    let chunk_secs = samples_16k.len() as f64 / 16000.0;
     let segments = match state
         .audio_manager
-        .speech_segments(samples_16k, vad, device_name, is_output_device)
+        .speech_segments(samples_16k, vad.clone(), device_name, is_output_device)
         .await
     {
         Ok(segments) if !segments.is_empty() => segments,
@@ -419,7 +532,50 @@ async fn transcribe_speaker_segments(
         screenpipe_audio::same_utterance::envelope_db(samples_16k, 16000)
     };
     let mut results = Vec::with_capacity(segments.len());
-    for segment in segments {
+    let last = segments.len() - 1;
+    for (index, mut segment) in segments.into_iter().enumerate() {
+        match head_segment(segment.start, segment.end, covered) {
+            HeadSegment::Keep => {}
+            HeadSegment::Skip => continue,
+            HeadSegment::TrimStart(secs) => {
+                let cut = ((secs * segment.sample_rate as f64) as usize).min(segment.samples.len());
+                segment.samples.drain(..cut);
+                segment.start += secs;
+            }
+        }
+        // The file ends mid-sentence: fetch the rest from the next file.
+        if index == last
+            && segment.sample_rate == 16000
+            && segment.end >= chunk_secs - BOUNDARY_SECS
+        {
+            if let Some(head) = next_file_head(state, chunk, device_name).await {
+                let rest = state
+                    .audio_manager
+                    .speech_segments(&head, vad.clone(), device_name, is_output_device)
+                    .await
+                    .ok()
+                    .and_then(|segments| segments.into_iter().next())
+                    .filter(|rest| {
+                        rest.start <= BOUNDARY_SECS
+                            && rest.sample_rate == 16000
+                            && (segment.end - segment.start) + (rest.end - rest.start)
+                                <= JOINED_MAX_SECS
+                    });
+                if let Some(rest) = rest {
+                    let (mine, theirs) = (
+                        known_speaker(state, &segment.embedding).await,
+                        known_speaker(state, &rest.embedding).await,
+                    );
+                    if mine.is_none() || theirs.is_none() || mine == theirs {
+                        segment.samples.extend_from_slice(&rest.samples);
+                        segment.end = chunk_secs + rest.end;
+                        if segment.embedding.is_empty() {
+                            segment.embedding = rest.embedding;
+                        }
+                    }
+                }
+            }
+        }
         let text = match session
             .transcribe(&segment.samples, segment.sample_rate, device_name)
             .await
@@ -466,7 +622,13 @@ async fn transcribe_speaker_segments(
         // cover these, this segment is that sentence again: the louder mic
         // keeps it. Decided before the speaker lookup, so the copy neither
         // creates nor trains a per-microphone speaker.
-        if let Some(theirs) = louder_mic_audio(&levels, segment.start, segment.end, device_name, other_mics) {
+        if let Some(theirs) = louder_mic_audio(
+            &levels,
+            segment.start,
+            segment.end.min(chunk_secs),
+            device_name,
+            other_mics,
+        ) {
             match session.transcribe(&theirs, 16000, device_name).await {
                 Ok(their_text)
                     if screenpipe_audio::same_utterance::text_covered(&text, &their_text) =>
@@ -979,6 +1141,7 @@ pub async fn retranscribe_handler(
                 is_output_device,
                 chunk.id,
                 &other_mics,
+                chunk,
             )
             .await
             {
@@ -1704,6 +1867,19 @@ mod tests {
                 is_input: true,
             }
         );
+    }
+
+    #[test]
+    fn head_of_a_file_already_stored_on_the_previous_one_is_skipped() {
+        // Nothing joined: everything is kept.
+        assert_eq!(head_segment(0.0, 2.4, 0.0), HeadSegment::Keep);
+        // The joined sentence took the first 2.4 s.
+        assert_eq!(head_segment(0.0, 2.4, 2.4), HeadSegment::Skip);
+        assert_eq!(head_segment(0.1, 2.7, 2.4), HeadSegment::Skip);
+        assert_eq!(head_segment(3.1, 6.0, 2.4), HeadSegment::Keep);
+        assert_eq!(head_segment(2.2, 5.0, 2.4), HeadSegment::Keep);
+        // This pass cut the head longer than the earlier one did: keep the new part.
+        assert_eq!(head_segment(0.0, 6.0, 2.4), HeadSegment::TrimStart(2.4));
     }
 
     #[test]
