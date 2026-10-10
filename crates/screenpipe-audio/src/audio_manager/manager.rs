@@ -564,6 +564,10 @@ impl AudioManager {
                 let config = self.options.read().await.meeting_streaming.clone();
                 let audio_rx = self.meeting_audio_tap.subscribe();
                 let meeting_engine = self.meeting_streaming_engine().await;
+                crate::meeting_streaming::install_live_speaker_identifier(
+                    self.segmentation_manager.clone(),
+                    self.db.clone(),
+                );
                 *meeting_streaming_handle = Some(start_meeting_streaming_loop(
                     config,
                     self.meeting_audio_tap.clone(),

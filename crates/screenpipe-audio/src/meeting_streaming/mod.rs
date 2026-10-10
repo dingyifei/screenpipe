@@ -6,6 +6,7 @@ mod config;
 mod controller;
 mod deepgram_live;
 mod events;
+mod live_speaker;
 mod net;
 mod selected_engine;
 
@@ -14,4 +15,7 @@ pub use controller::{start_meeting_streaming_loop, MEETING_STREAMING_REATTACH_EV
 pub use events::{
     MeetingAudioFrame, MeetingAudioTap, MeetingLifecycleEvent, MeetingStreamingSessionEnded,
     MeetingStreamingSessionStarted, MeetingStreamingStatusChanged,
+};
+pub use live_speaker::{
+    install_live_speaker_identifier, MeetingTranscriptSpeaker, MEETING_TRANSCRIPT_SPEAKER_EVENT,
 };
