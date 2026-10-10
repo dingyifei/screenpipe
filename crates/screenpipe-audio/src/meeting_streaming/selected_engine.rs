@@ -213,6 +213,44 @@ fn hand_off(buffer: &mut LiveChunkBuffer, mailbox: &ChunkMailbox) {
     mailbox.put(chunk);
 }
 
+/// Speech gate for live chunks: the same VAD criterion the batch path applies
+/// to a whole 30 s chunk, applied to each short cut. The RMS check in
+/// `hand_off` only removes digital silence; room noise passes it, and an STT
+/// model handed two seconds of room noise answers with a filler word.
+/// One detector per stream, because Silero carries state between frames.
+struct VoiceGate {
+    vad: Option<tokio::sync::Mutex<Box<dyn crate::vad::VadEngine>>>,
+    is_output_device: bool,
+}
+
+impl VoiceGate {
+    async fn new(is_output_device: bool) -> Self {
+        let vad = match crate::vad::create_vad_engine(crate::vad::VadEngineEnum::Silero).await {
+            Ok(vad) => Some(tokio::sync::Mutex::new(vad)),
+            Err(e) => {
+                warn!(
+                    "meeting streaming: no vad for the live speech gate ({}), transcribing every chunk",
+                    e
+                );
+                None
+            }
+        };
+        Self {
+            vad,
+            is_output_device,
+        }
+    }
+
+    /// `true` when the chunk should be transcribed. Without a detector nothing is gated.
+    async fn has_speech(&self, samples_16k: &[f32]) -> bool {
+        let Some(vad) = &self.vad else {
+            return true;
+        };
+        crate::vad::speech_ratio(samples_16k, vad, self.is_output_device).await
+            > crate::vad::min_speech_ratio()
+    }
+}
+
 /// Transcribe chunks handed over by the ingest loop until the mailbox closes. A
 /// transcribe error ends the stream (returns `Err`) so the controller
 /// un-suppresses batch recording, surfaces the error, and restarts with backoff.
@@ -228,9 +266,14 @@ async fn transcribe_loop(
     model: Option<String>,
 ) -> Result<()> {
     let mut sequence: u64 = 0;
+    let voice_gate = VoiceGate::new(device_type == "output").await;
     loop {
         mailbox.notify.notified().await;
         while let Some(chunk) = mailbox.take() {
+            if !voice_gate.has_speech(&chunk.samples).await {
+                debug!("meeting streaming: selected-engine live chunk had no speech; skipping");
+                continue;
+            }
             transcribe_chunk(
                 chunk,
                 &mut session,
@@ -498,6 +541,30 @@ fn emit_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn voice_gate_drops_room_noise_level_audio() {
+        let gate = VoiceGate::new(false).await;
+        if gate.vad.is_none() {
+            return; // no detector on this machine: nothing is gated, by design
+        }
+        // Two seconds of low-level noise, above MIN_LIVE_RMS so `hand_off` lets it through.
+        let noise: Vec<f32> = (0..32_000)
+            .map(|i| if (i * 7919) % 13 < 6 { 0.006 } else { -0.006 })
+            .collect();
+        assert!(rms(&noise) >= MIN_LIVE_RMS);
+        assert!(!gate.has_speech(&noise).await);
+        assert!(!gate.has_speech(&[]).await);
+    }
+
+    #[tokio::test]
+    async fn voice_gate_without_a_detector_gates_nothing() {
+        let gate = VoiceGate {
+            vad: None,
+            is_output_device: false,
+        };
+        assert!(gate.has_speech(&[0.0; 1600]).await);
+    }
 
     #[test]
     fn live_chunk_buffer_flushes_and_resets() {
