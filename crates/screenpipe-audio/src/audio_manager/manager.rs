@@ -2218,6 +2218,62 @@ impl AudioManager {
         self.options.read().await.batch_max_duration_secs
     }
 
+    /// A voice-activity detector of the configured kind that shares no state
+    /// with the live pipeline. Silero carries LSTM state across frames, so
+    /// anything that replays recorded audio must not borrow the live one.
+    pub async fn detached_vad(&self) -> Arc<Mutex<Box<dyn VadEngine + Send>>> {
+        match SileroVad::new().await {
+            Ok(vad) => Arc::new(Mutex::new(Box::new(vad))),
+            Err(e) => {
+                warn!("silero vad unavailable, falling back to webrtc: {}", e);
+                Arc::new(Mutex::new(Box::new(WebRtcVad::new())))
+            }
+        }
+    }
+
+    /// Speech segments of an already-recorded chunk (16 kHz mono), each with
+    /// its voice embedding: the same VAD, segmentation and embedding the live
+    /// path runs before STT. Empty when the chunk is below the speech
+    /// threshold. `vad` should come from [`Self::detached_vad`].
+    pub async fn speech_segments(
+        &self,
+        samples_16k: &[f32],
+        vad: Arc<Mutex<Box<dyn VadEngine + Send>>>,
+        device: &str,
+        is_output_device: bool,
+    ) -> Result<Vec<crate::speaker::segment::SpeechSegment>> {
+        let segmentation_manager = self.segmentation_manager.clone();
+        let segmentation_model_path = segmentation_manager
+            .segmentation_model_path
+            .lock()
+            .await
+            .clone();
+        let embedding_extractor = segmentation_manager
+            .embedding_extractor
+            .lock()
+            .await
+            .clone();
+        let (mut receiver, speech_ratio_ok, _) = crate::speaker::prepare_segments(
+            samples_16k,
+            vad,
+            segmentation_model_path.as_ref(),
+            segmentation_manager.embedding_manager.clone(),
+            embedding_extractor,
+            device,
+            is_output_device,
+            false,
+        )
+        .await?;
+        if !speech_ratio_ok {
+            return Ok(Vec::new());
+        }
+        let mut segments = Vec::new();
+        while let Some(segment) = receiver.recv().await {
+            segments.push(segment);
+        }
+        Ok(segments)
+    }
+
     /// Returns the current languages.
     pub async fn languages(&self) -> Vec<screenpipe_core::Language> {
         self.options.read().await.languages.clone()
