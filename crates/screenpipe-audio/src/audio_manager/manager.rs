@@ -563,12 +563,13 @@ impl AudioManager {
             if meeting_streaming_handle.is_none() {
                 let config = self.options.read().await.meeting_streaming.clone();
                 let audio_rx = self.meeting_audio_tap.subscribe();
+                let meeting_engine = self.meeting_streaming_engine().await;
                 *meeting_streaming_handle = Some(start_meeting_streaming_loop(
                     config,
                     self.meeting_audio_tap.clone(),
                     audio_rx,
                     self.db.clone(),
-                    self.engine.clone(),
+                    meeting_engine,
                     self.on_transcription_insert.clone(),
                 ));
             }
@@ -1390,6 +1391,54 @@ impl AudioManager {
         });
 
         Ok(recording_handle)
+    }
+
+    /// Engine handle for meeting live streaming.
+    ///
+    /// Normally the shared live engine. When background STT is `disabled`, an
+    /// OpenAI-compatible endpoint is configured (deferred transcription: chunks
+    /// are persisted and retranscribed later through that endpoint) and the
+    /// meeting provider setting opts in with `openai-compatible`, meeting
+    /// streaming gets its own OpenAI-compatible engine, so meetings have live
+    /// notes without turning 24/7 transcription on. Without the opt-in,
+    /// `disabled` keeps meeting audio away from every endpoint.
+    async fn meeting_streaming_engine(&self) -> Arc<RwLock<Option<TranscriptionEngine>>> {
+        let options = self.options.read().await;
+        let fallback = meeting_streaming_fallback_config(
+            options.meeting_streaming.openai_compatible_fallback,
+            options.transcription_engine.as_ref(),
+            options.openai_compatible_config.as_ref(),
+        );
+        let languages = options.languages.clone();
+        let vocabulary = options.vocabulary.clone();
+        drop(options);
+
+        let Some(openai_compatible_config) = fallback else {
+            return self.engine.clone();
+        };
+        match TranscriptionEngine::new(
+            Arc::new(AudioTranscriptionEngine::OpenAICompatible),
+            None,
+            Some(openai_compatible_config),
+            languages,
+            vocabulary,
+        )
+        .await
+        {
+            Ok(engine) => {
+                info!(
+                    "meeting streaming: background STT is disabled and the provider opts in, using the openai-compatible engine for live notes"
+                );
+                Arc::new(RwLock::new(Some(engine)))
+            }
+            Err(e) => {
+                warn!(
+                    "meeting streaming: could not build the openai-compatible engine ({}), live notes stay unavailable",
+                    e
+                );
+                self.engine.clone()
+            }
+        }
     }
 
     async fn get_or_create_transcription_engine(
@@ -2613,6 +2662,20 @@ impl Drop for AudioManager {
     }
 }
 
+/// The OpenAI-compatible config meeting streaming should run on instead of the
+/// shared engine: only when the user opted in, background STT is `disabled` and
+/// an endpoint is set.
+fn meeting_streaming_fallback_config(
+    opted_in: bool,
+    live_engine: &AudioTranscriptionEngine,
+    openai_compatible_config: Option<&crate::OpenAICompatibleConfig>,
+) -> Option<crate::OpenAICompatibleConfig> {
+    if !opted_in || *live_engine != AudioTranscriptionEngine::Disabled {
+        return None;
+    }
+    openai_compatible_config.cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2623,6 +2686,48 @@ mod tests {
         Arc,
     };
     use tokio::sync::{Barrier, Notify, Semaphore};
+
+    #[test]
+    fn meeting_streaming_falls_back_only_when_opted_in_and_live_engine_is_disabled() {
+        let cfg = crate::OpenAICompatibleConfig {
+            endpoint: "http://127.0.0.1:8000".to_string(),
+            model: "local-asr".to_string(),
+            ..Default::default()
+        };
+
+        let fallback = meeting_streaming_fallback_config(
+            true,
+            &AudioTranscriptionEngine::Disabled,
+            Some(&cfg),
+        )
+        .expect("opted in, disabled live engine and an endpoint: falls back");
+        assert_eq!(fallback.endpoint, "http://127.0.0.1:8000");
+        assert_eq!(fallback.model, "local-asr");
+
+        // `disabled` without the opt-in stays fail-closed.
+        assert!(meeting_streaming_fallback_config(
+            false,
+            &AudioTranscriptionEngine::Disabled,
+            Some(&cfg)
+        )
+        .is_none());
+        assert!(
+            meeting_streaming_fallback_config(true, &AudioTranscriptionEngine::Disabled, None)
+                .is_none()
+        );
+        assert!(meeting_streaming_fallback_config(
+            true,
+            &AudioTranscriptionEngine::OpenAICompatible,
+            Some(&cfg)
+        )
+        .is_none());
+        assert!(meeting_streaming_fallback_config(
+            true,
+            &AudioTranscriptionEngine::Parakeet,
+            Some(&cfg)
+        )
+        .is_none());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_audio_handlers_cancel_and_restart_without_stealing_queued_capture() {

@@ -62,6 +62,12 @@ pub struct MeetingStreamingConfig {
     /// streaming analog of the batch path's keyterms. Empty = no biasing.
     #[serde(default)]
     pub keyterms: Vec<String>,
+    /// Explicit opt-in (provider setting `openai-compatible`): when background
+    /// STT is `disabled`, run the selected-engine provider on the configured
+    /// OpenAI-compatible endpoint instead. Off by default, so `disabled` alone
+    /// never sends meeting audio to any endpoint.
+    #[serde(default)]
+    pub openai_compatible_fallback: bool,
 }
 
 impl Default for MeetingStreamingConfig {
@@ -109,6 +115,7 @@ impl Default for MeetingStreamingConfig {
             local_speaker_name: env_non_empty("SCREENPIPE_MEETING_LOCAL_SPEAKER_NAME"),
             persist_finals: true,
             keyterms: Vec::new(),
+            openai_compatible_fallback: false,
         }
     }
 }
@@ -129,7 +136,9 @@ impl FromStr for MeetingStreamingProvider {
             | "transcription_engine"
             | "local"
             | "local-engine"
-            | "local_engine" => Ok(Self::SelectedEngine),
+            | "local_engine"
+            | "openai-compatible"
+            | "openai_compatible" => Ok(Self::SelectedEngine),
             "screenpipe-cloud" | "screenpipe_cloud" | "screenpipe" | "cloud" => {
                 Ok(Self::ScreenpipeCloud)
             }
@@ -194,6 +203,7 @@ impl MeetingStreamingConfig {
         language: Option<String>,
         local_speaker_name: Option<String>,
     ) -> Self {
+        let provider_setting = provider;
         let provider = MeetingStreamingProvider::from_str(provider)
             .unwrap_or(MeetingStreamingProvider::SelectedEngine);
         let auth_token = cloud_token.and_then(|token| non_empty_trimmed(&token));
@@ -205,6 +215,7 @@ impl MeetingStreamingConfig {
             auth_token,
             language: language.filter(|s| !s.trim().is_empty()),
             local_speaker_name: local_speaker_name.and_then(|name| non_empty_trimmed(&name)),
+            openai_compatible_fallback: is_openai_compatible_provider(provider_setting),
             ..Self::default()
         };
 
@@ -275,6 +286,13 @@ fn env_non_empty(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn is_openai_compatible_provider(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "openai-compatible" | "openai_compatible"
+    )
+}
+
 fn non_empty_trimmed(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -320,6 +338,30 @@ fn normalize_realtime_endpoint(value: &str, default_path: &str) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openai_compatible_provider_is_selected_engine_with_explicit_fallback() {
+        let opted_in = MeetingStreamingConfig::from_settings(
+            true,
+            "openai-compatible",
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(opted_in.provider, MeetingStreamingProvider::SelectedEngine);
+        assert!(opted_in.openai_compatible_fallback);
+
+        // The default provider must not opt in.
+        let default_provider =
+            MeetingStreamingConfig::from_settings(true, "selected-engine", None, None, None, None);
+        assert_eq!(
+            default_provider.provider,
+            MeetingStreamingProvider::SelectedEngine
+        );
+        assert!(!default_provider.openai_compatible_fallback);
+        assert!(!MeetingStreamingConfig::default().openai_compatible_fallback);
+    }
 
     #[test]
     fn screenpipe_cloud_uses_cloud_token_for_readiness() {
