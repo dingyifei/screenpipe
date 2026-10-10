@@ -50,6 +50,7 @@ pub mod idle_detector;
 pub mod meeting_detector;
 pub mod meeting_processes;
 pub mod meeting_streaming;
+pub mod same_utterance;
 mod segmentation;
 
 /// Serializes tests that create CoreAudio taps on our own pid or introspect

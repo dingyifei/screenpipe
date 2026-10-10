@@ -167,6 +167,7 @@ pub fn start_meeting_streaming_loop(
                     Some(meeting.meeting_app),
                     meeting.title,
                     attendee_keyterms,
+                    None,
                 )
                 .await;
             }
@@ -202,6 +203,7 @@ pub fn start_meeting_streaming_loop(
                         event.data.app.clone(),
                         event.data.display_title().map(str::to_string),
                         attendee_keyterms,
+                        event.data.language.clone(),
                     )
                     .await;
                 }
@@ -242,6 +244,7 @@ pub fn start_meeting_streaming_loop(
                         event.data.app.clone(),
                         event.data.display_title().map(str::to_string),
                         attendee_keyterms,
+                        event.data.language.clone(),
                     )
                     .await;
                 }
@@ -396,12 +399,18 @@ async fn start_streaming_session(
     app: Option<String>,
     title: Option<String>,
     extra_keyterms: Vec<String>,
+    language: Option<String>,
 ) {
     if let Some(previous) = active.take() {
         emit_session_ended(previous);
     }
 
     let mut session_config = effective_streaming_config(config, transcription_engine).await;
+    // Whoever started the meeting by hand may have said what language to
+    // expect ("auto" = no hint); that holds for this meeting only.
+    if language.is_some() {
+        session_config.language = language;
+    }
     // Bias live transcription toward this meeting's calendar attendee names, on
     // top of the user's vocabulary. Granola/Notion lean on exactly this — when
     // you know who's in the room, proper-noun accuracy jumps (measured: name WER
@@ -620,6 +629,7 @@ async fn persist_live_final_once(
             },
             event.session_speaker_id.as_deref(),
             event.speaker_name.as_deref(),
+            event.speaker_id,
             transcript,
             event.captured_at,
         )
@@ -1106,6 +1116,7 @@ mod tests {
             device_type: "input".into(),
             session_speaker_id: None,
             speaker_name: None,
+            speaker_id: None,
             transcript: "first saved turn".into(),
             captured_at: Utc::now(),
         };
@@ -1371,6 +1382,7 @@ mod tests {
             Some("manual".to_string()),
             None,
             Vec::new(),
+            None,
         )
         .await;
 
@@ -1397,6 +1409,7 @@ mod tests {
             Some("manual".to_string()),
             None,
             Vec::new(),
+            None,
         )
         .await;
 

@@ -136,6 +136,9 @@ pub struct RetranscribeRequest {
     /// embedding). Off by default: one transcription per chunk, no speaker.
     #[serde(default)]
     pub speakers: bool,
+    /// Language to tell the engine to expect: a language code, or "auto" for
+    /// no hint. Absent uses the recorder's configured languages.
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -202,11 +205,127 @@ fn pinned_language_flipped(pinned: &str, unpinned: &str) -> bool {
             .any(|c| c.is_alphabetic() && !c.is_ascii_alphabetic())
 }
 
+/// How far apart the files of two microphones may place the same sound. File
+/// times are stamped loosely (a recording's later files run about 2 s late),
+/// and a Bluetooth mic trails a built-in one.
+const OTHER_MIC_LAG_SECS: f64 = 3.0;
+/// Files of another mic starting this close to a chunk can overlap it.
+const OTHER_MIC_WINDOW_SECS: i64 = 32;
+/// Decoded files of other mics kept across the chunks of one request.
+const OTHER_MIC_FILES_KEPT: usize = 6;
+/// Audio taken either side of the matching span when asking what the other mic heard.
+const OTHER_MIC_TEXT_PAD_SECS: f64 = 0.3;
+
+/// The recording of another microphone that overlaps a chunk in time.
+struct OtherMicFile {
+    chunk_id: i64,
+    timestamp: DateTime<Utc>,
+    samples_16k: Vec<f32>,
+    levels: Vec<f32>,
+}
+
+/// Files of the other input devices that can overlap `chunk`, decoded, with
+/// each one's start relative to the chunk's in seconds. `cache` carries
+/// decoded files from one chunk of a request to the next.
+async fn other_mic_files(
+    state: &AppState,
+    cache: &mut std::collections::VecDeque<Arc<OtherMicFile>>,
+    chunk: &AudioChunkInfo,
+    device_name: &str,
+) -> Vec<(f64, Arc<OtherMicFile>)> {
+    let window = chrono::Duration::seconds(OTHER_MIC_WINDOW_SECS);
+    let nearby = match state
+        .db
+        .get_audio_chunks_in_range(chunk.timestamp - window, chunk.timestamp + window)
+        .await
+    {
+        Ok(nearby) => nearby,
+        Err(e) => {
+            warn!(
+                "retranscribe: no other-mic lookup for chunk {}: {}",
+                chunk.id, e
+            );
+            return Vec::new();
+        }
+    };
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    for other in &nearby {
+        let device = retranscribe_chunk_device(other);
+        if other.id == chunk.id
+            || !device.is_input
+            || device.name == device_name
+            || !seen.insert(other.id)
+        {
+            continue;
+        }
+        let file = match cache.iter().find(|f| f.chunk_id == other.id) {
+            Some(file) => file.clone(),
+            None => {
+                let Ok((samples, sample_rate)) = screenpipe_audio::utils::ffmpeg::read_audio_from_file(
+                    StdPath::new(&other.file_path),
+                ) else {
+                    continue;
+                };
+                let Ok(samples_16k) = (if sample_rate == 16000 {
+                    Ok(samples)
+                } else {
+                    screenpipe_audio::resample(&samples, sample_rate, 16000)
+                }) else {
+                    continue;
+                };
+                let file = Arc::new(OtherMicFile {
+                    chunk_id: other.id,
+                    timestamp: other.timestamp,
+                    levels: screenpipe_audio::same_utterance::envelope_db(&samples_16k, 16000),
+                    samples_16k,
+                });
+                cache.push_back(file.clone());
+                if cache.len() > OTHER_MIC_FILES_KEPT {
+                    cache.pop_front();
+                }
+                file
+            }
+        };
+        let starts_after = (file.timestamp - chunk.timestamp).num_milliseconds() as f64 / 1000.0;
+        files.push((starts_after, file));
+    }
+    files
+}
+
+/// The audio of another microphone that carries `[start, end]` (seconds into
+/// this chunk) as the same sound, louder. See `screenpipe_audio::same_utterance`.
+fn louder_mic_audio(
+    levels: &[f32],
+    start: f64,
+    end: f64,
+    others: &[(f64, Arc<OtherMicFile>)],
+) -> Option<Vec<f32>> {
+    use screenpipe_audio::same_utterance::{louder_copy_at, ENVELOPE_FPS};
+    let fps = ENVELOPE_FPS as f64;
+    let span = ((start * fps) as usize, (end * fps).ceil() as usize);
+    others.iter().find_map(|(starts_after, file)| {
+        let at = louder_copy_at(
+            levels,
+            span,
+            &file.levels,
+            (-starts_after * fps).round() as i64,
+            (OTHER_MIC_LAG_SECS * fps) as usize,
+        )?;
+        let per_frame = 16000 / ENVELOPE_FPS;
+        let pad = (OTHER_MIC_TEXT_PAD_SECS * fps) as usize;
+        let from = at.saturating_sub(pad) * per_frame;
+        let to = ((at + (span.1 - span.0) + pad) * per_frame).min(file.samples_16k.len());
+        (from < to).then(|| file.samples_16k[from..to].to_vec())
+    })
+}
+
 /// Transcribe one chunk segment by segment, with a speaker per segment.
 /// `None` means "fall back to one transcription for the whole chunk": no
 /// segments found, or an STT failure part-way that would leave holes. An empty
 /// list means it ran and nothing was worth keeping (every segment came back
-/// empty or as a filler).
+/// empty or as a filler, or was another microphone's sentence again).
+#[allow(clippy::too_many_arguments)]
 async fn transcribe_speaker_segments(
     state: &AppState,
     vad: Arc<Mutex<Box<dyn VadEngine + Send>>>,
@@ -219,6 +338,7 @@ async fn transcribe_speaker_segments(
     device_name: &str,
     is_output_device: bool,
     chunk_id: i64,
+    other_mics: &[(f64, Arc<OtherMicFile>)],
 ) -> Option<Vec<RetranscribeSegmentResult>> {
     let resampled;
     let samples_16k: &[f32] = if sample_rate == 16000 {
@@ -254,6 +374,11 @@ async fn transcribe_speaker_segments(
         }
     };
 
+    let levels = if other_mics.is_empty() {
+        Vec::new()
+    } else {
+        screenpipe_audio::same_utterance::envelope_db(samples_16k, 16000)
+    };
     let mut results = Vec::with_capacity(segments.len());
     for segment in segments {
         let text = match session
@@ -296,6 +421,25 @@ async fn transcribe_speaker_segments(
         // the model answering noise or a breath, not a word worth a row.
         if duration < FILLER_ONLY_MAX_SECS && is_filler_only(&text) {
             continue;
+        }
+        // Two microphones in one room each record every sentence. When another
+        // mic has this stretch as the same sound, louder, and its words there
+        // cover these, this segment is that sentence again: the louder mic
+        // keeps it. Decided before the speaker lookup, so the copy neither
+        // creates nor trains a per-microphone speaker.
+        if let Some(theirs) = louder_mic_audio(&levels, segment.start, segment.end, other_mics) {
+            match session.transcribe(&theirs, 16000, device_name).await {
+                Ok(their_text)
+                    if screenpipe_audio::same_utterance::text_covered(&text, &their_text) =>
+                {
+                    debug!(
+                        "retranscribe: segment at {:.1}s of chunk {} is another mic's sentence; dropping",
+                        segment.start, chunk_id
+                    );
+                    continue;
+                }
+                _ => {}
+            }
         }
         let speaker_id = if segment.embedding.is_empty() {
             None
@@ -622,7 +766,24 @@ pub async fn retranscribe_handler(
 
     let deepgram_config = audio_manager.deepgram_config().await;
     let openai_compatible_config = audio_manager.openai_compatible_config().await;
-    let languages = audio_manager.languages().await;
+    let languages = match request
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        None => audio_manager.languages().await,
+        Some(code) if code.eq_ignore_ascii_case("auto") => Vec::new(),
+        Some(code) => match code.parse::<screenpipe_core::Language>() {
+            Ok(language) => vec![language],
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown language: {}", code),
+                )
+            }
+        },
+    };
 
     // Build effective vocabulary: user-provided + prompt words as bias entries
     let mut effective_vocabulary = vocabulary;
@@ -691,6 +852,7 @@ pub async fn retranscribe_handler(
 
     // Deduplicate chunks by ID (multiple transcription rows per chunk)
     let mut seen_ids = std::collections::HashSet::new();
+    let mut other_mic_cache = std::collections::VecDeque::new();
 
     for chunk in &chunks {
         if !seen_ids.insert(chunk.id) {
@@ -762,6 +924,11 @@ pub async fn retranscribe_handler(
             let mut unpinned_session = unpinned_engine
                 .as_ref()
                 .and_then(|e| e.create_session().ok());
+            let other_mics = if is_input {
+                other_mic_files(&state, &mut other_mic_cache, chunk, device_name).await
+            } else {
+                Vec::new()
+            };
             if let Some(segments) = transcribe_speaker_segments(
                 &state,
                 vad,
@@ -772,6 +939,7 @@ pub async fn retranscribe_handler(
                 device_name,
                 is_output_device,
                 chunk.id,
+                &other_mics,
             )
             .await
             {

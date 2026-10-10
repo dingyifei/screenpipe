@@ -55,6 +55,7 @@ mod timeline_live_meeting_tests {
                 stream_id,
                 Some(session_speaker_id),
                 Some("speaker 1"),
+                None,
                 "provider timestamp zero turn",
                 captured_at,
             )

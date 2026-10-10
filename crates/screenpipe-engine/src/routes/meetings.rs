@@ -76,6 +76,9 @@ pub struct StartMeetingRequest {
     /// from a "Coming Up" entry. Claimed for this meeting so the same event
     /// cannot also name the next one. See [`claim_calendar_event`].
     pub calendar_event_id: Option<String>,
+    /// Speech language for this meeting's live transcription: a language code,
+    /// or "auto" for no hint. Absent keeps the configured behaviour.
+    pub language: Option<String>,
 }
 
 /// Whether calendar-sourced `title`/`attendees` may be written to this meeting.
@@ -909,6 +912,20 @@ pub(crate) async fn start_meeting_handler(
 ) -> Result<JsonResponse<MeetingRecord>, (StatusCode, JsonResponse<Value>)> {
     let app = body.app.as_deref().unwrap_or("manual");
     let resumed_existing = body.id.is_some();
+    let language = body
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
+    if let Some(code) = language {
+        if !code.eq_ignore_ascii_case("auto") && code.parse::<screenpipe_core::Language>().is_err()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": format!("unknown language: {}", code)})),
+            ));
+        }
+    }
 
     // Resolve the current active meeting up-front so every branch can reason
     // about it. This is the guard that prevents a second open `meetings` row
@@ -1132,7 +1149,8 @@ pub(crate) async fn start_meeting_handler(
                 "manual"
             } else {
                 meeting.detection_source.as_str()
-            }
+            },
+            "language": language
         }),
     ) {
         tracing::warn!("failed to emit meeting_started event: {}", e);
