@@ -795,6 +795,7 @@ mod tests {
             local_speaker_name: None,
             persist_finals: true,
             keyterms: vec![],
+            openai_compatible_fallback: false,
         };
         let mut url = Url::parse(&config.endpoint).unwrap();
         configure_live_query(&mut url, &config);
@@ -824,6 +825,7 @@ mod tests {
                 "  ".to_string(),
                 "Arvind".to_string(),
             ],
+            openai_compatible_fallback: false,
         };
         let mut url = Url::parse(&config.endpoint).unwrap();
         configure_live_query(&mut url, &config);
@@ -903,6 +905,7 @@ mod tests {
             local_speaker_name: None,
             persist_finals: true,
             keyterms: vec![],
+            openai_compatible_fallback: false,
         };
 
         let mut url = Url::parse(&config.endpoint).unwrap();
