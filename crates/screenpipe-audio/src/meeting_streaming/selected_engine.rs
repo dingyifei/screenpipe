@@ -122,9 +122,19 @@ fn louder_mic(meeting_id: i64, device_name: &str, start_ms: u64, end_ms: u64) ->
     meeting
         .iter()
         .filter(|(name, _)| name.as_str() != device_name)
-        .find(|(_, other)| {
+        .find(|(name, other)| {
             let theirs = other.levels_from(from.saturating_sub(lag), frames + 2 * lag_frames);
-            louder_copy_at(&mine, (0, frames), &theirs, lag_frames as i64, lag_frames).is_some()
+            // Level mics: the one whose name sorts first keeps the line.
+            let wins_ties = device_name < name.as_str();
+            louder_copy_at(
+                &mine,
+                (0, frames),
+                &theirs,
+                lag_frames as i64,
+                lag_frames,
+                wins_ties,
+            )
+            .is_some()
         })
         .map(|(name, _)| name.clone())
 }
