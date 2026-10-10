@@ -288,6 +288,7 @@ async fn transcribe_loop(
 ) -> Result<()> {
     let mut sequence: u64 = 0;
     let voice_gate = VoiceGate::new(device_type == "output").await;
+    let speaker_vad = super::live_speaker::new_live_vad().await;
     loop {
         mailbox.notify.notified().await;
         while let Some(chunk) = mailbox.take() {
@@ -305,6 +306,7 @@ async fn transcribe_loop(
                 &device_type,
                 model.clone(),
                 &mut sequence,
+                speaker_vad.as_ref(),
             )
             .await?;
         }
@@ -324,6 +326,7 @@ async fn transcribe_loop(
             &device_type,
             model.clone(),
             &mut sequence,
+            speaker_vad.as_ref(),
         )
         .await?;
     }
@@ -400,6 +403,7 @@ async fn transcribe_chunk(
     device_type: &str,
     model: Option<String>,
     sequence: &mut u64,
+    speaker_vad: Option<&super::live_speaker::LiveVad>,
 ) -> Result<()> {
     let transcript = session
         .transcribe(&chunk.samples, LIVE_SAMPLE_RATE, device_name)
@@ -418,7 +422,18 @@ async fn transcribe_chunk(
     let captured_at = captured_at_from_ms(chunk.captured_at_unix_ms);
     // Who is speaking, by voice. A named match replaces the device-based
     // label; an unnamed one keeps it and is announced by id alone.
-    let voice = super::live_speaker::identify(&chunk.samples).await;
+    let voice = match speaker_vad {
+        Some(vad) => {
+            super::live_speaker::identify(
+                &chunk.samples,
+                vad.clone(),
+                device_name,
+                device_type == "output",
+            )
+            .await
+        }
+        None => None,
+    };
     let device_speaker_name = if device_type == "input" {
         config.local_speaker_name.clone()
     } else {

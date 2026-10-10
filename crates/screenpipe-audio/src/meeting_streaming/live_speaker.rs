@@ -52,41 +52,70 @@ pub fn install_live_speaker_identifier(
     let _ = IDENTIFIER.set(Identifier { segmentation, db });
 }
 
-/// Live chunks shorter than this are not matched at all.
+/// Speech segments shorter than this are not matched at all.
 const MIN_LIVE_IDENTIFY_SECS: f64 = 1.0;
 
-/// The stored speaker whose voice this chunk (16 kHz mono) matches. `None`
-/// when the models are not ready, the chunk is too short, or nobody matches
-/// unambiguously.
+/// A voice detector for one live stream's identification passes.
+pub(crate) type LiveVad = Arc<tokio::sync::Mutex<Box<dyn crate::vad::VadEngine + Send>>>;
+
+pub(crate) async fn new_live_vad() -> Option<LiveVad> {
+    let vad = crate::vad::silero::SileroVad::new().await.ok()?;
+    Some(Arc::new(tokio::sync::Mutex::new(Box::new(vad))))
+}
+
+/// The stored speaker whose voice dominates this chunk (16 kHz mono). `None`
+/// when the models are not ready, no segment is long enough, or nobody
+/// matches unambiguously.
 ///
-/// Read-only on purpose. A live chunk is cut at a pause, not by the speaker
-/// segmenter, so it can hold two voices or a voice over other sound; letting
-/// it create speakers or update a stored profile would let that audio drift a
-/// named person's profile. Only the batch path, which embeds single-speaker
-/// segments, writes to the speaker store. A new voice therefore gets its live
-/// label once that path has created it.
-pub(crate) async fn identify(samples_16k: &[f32]) -> Option<LiveSpeaker> {
+/// The chunk goes through the batch path's own preparation
+/// (`prepare_segments`: normalization, VAD, speaker segmentation, one
+/// embedding per single-speaker segment) and the longest segment is matched.
+/// Embedding the raw chunk instead matched two different voices to the same
+/// stored speaker.
+///
+/// Read-only on the speaker store, on purpose: live audio must not create
+/// speakers or update a stored profile; only the batch path writes there. A
+/// new voice therefore gets its live label once that path has created it.
+pub(crate) async fn identify(
+    samples_16k: &[f32],
+    vad: LiveVad,
+    device_name: &str,
+    is_output_device: bool,
+) -> Option<LiveSpeaker> {
     let identifier = IDENTIFIER.get()?;
-    let extractor = identifier
-        .segmentation
-        .embedding_extractor
-        .lock()
-        .await
-        .clone()?;
-    if (samples_16k.len() as f64 / 16_000.0) < MIN_LIVE_IDENTIFY_SECS {
-        return None;
-    }
-    let samples = samples_16k.to_vec();
-    let embedding: Vec<f32> = tokio::task::spawn_blocking(move || {
-        let mut extractor = extractor.lock().ok()?;
-        extractor.compute(&samples).ok().map(Iterator::collect)
-    })
+    let segmentation = &identifier.segmentation;
+    let extractor = segmentation.embedding_extractor.lock().await.clone()?;
+    let model_path = segmentation.segmentation_model_path.lock().await.clone();
+    let (mut receiver, has_speech, _) = crate::speaker::prepare_segments(
+        samples_16k,
+        vad,
+        model_path.as_ref(),
+        segmentation.embedding_manager.clone(),
+        Some(extractor),
+        device_name,
+        is_output_device,
+        false,
+    )
     .await
-    .ok()??;
-    if embedding.is_empty() {
+    .ok()?;
+    if !has_speech {
         return None;
     }
-    match identifier.db.match_speaker_from_embedding(&embedding).await {
+    let mut best: Option<crate::speaker::segment::SpeechSegment> = None;
+    while let Some(segment) = receiver.recv().await {
+        let longer = best
+            .as_ref()
+            .is_none_or(|b| segment.end - segment.start > b.end - b.start);
+        if !segment.embedding.is_empty() && longer {
+            best = Some(segment);
+        }
+    }
+    let best = best.filter(|b| b.end - b.start >= MIN_LIVE_IDENTIFY_SECS)?;
+    match identifier
+        .db
+        .match_speaker_from_embedding(&best.embedding)
+        .await
+    {
         Ok(screenpipe_db::SpeakerEmbeddingMatch::Matched(speaker)) => Some(LiveSpeaker {
             id: speaker.id,
             name: Some(speaker.name).filter(|name| !name.trim().is_empty()),
