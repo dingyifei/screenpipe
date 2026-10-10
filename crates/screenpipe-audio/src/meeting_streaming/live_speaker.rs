@@ -52,9 +52,19 @@ pub fn install_live_speaker_identifier(
     let _ = IDENTIFIER.set(Identifier { segmentation, db });
 }
 
-/// The stored speaker whose voice this chunk (16 kHz mono) matches, creating
-/// one when the chunk is long enough and matches nobody. `None` when the
-/// models are not ready, the chunk is too short, or the match is ambiguous.
+/// Live chunks shorter than this are not matched at all.
+const MIN_LIVE_IDENTIFY_SECS: f64 = 1.0;
+
+/// The stored speaker whose voice this chunk (16 kHz mono) matches. `None`
+/// when the models are not ready, the chunk is too short, or nobody matches
+/// unambiguously.
+///
+/// Read-only on purpose. A live chunk is cut at a pause, not by the speaker
+/// segmenter, so it can hold two voices or a voice over other sound; letting
+/// it create speakers or update a stored profile would let that audio drift a
+/// named person's profile. Only the batch path, which embeds single-speaker
+/// segments, writes to the speaker store. A new voice therefore gets its live
+/// label once that path has created it.
 pub(crate) async fn identify(samples_16k: &[f32]) -> Option<LiveSpeaker> {
     let identifier = IDENTIFIER.get()?;
     let extractor = identifier
@@ -63,7 +73,9 @@ pub(crate) async fn identify(samples_16k: &[f32]) -> Option<LiveSpeaker> {
         .lock()
         .await
         .clone()?;
-    let duration_secs = samples_16k.len() as f64 / 16_000.0;
+    if (samples_16k.len() as f64 / 16_000.0) < MIN_LIVE_IDENTIFY_SECS {
+        return None;
+    }
     let samples = samples_16k.to_vec();
     let embedding: Vec<f32> = tokio::task::spawn_blocking(move || {
         let mut extractor = extractor.lock().ok()?;
@@ -74,18 +86,12 @@ pub(crate) async fn identify(samples_16k: &[f32]) -> Option<LiveSpeaker> {
     if embedding.is_empty() {
         return None;
     }
-    match crate::transcription::get_or_create_speaker_from_embedding(
-        &identifier.db,
-        &embedding,
-        duration_secs,
-    )
-    .await
-    {
-        Ok(Some(speaker)) => Some(LiveSpeaker {
+    match identifier.db.match_speaker_from_embedding(&embedding).await {
+        Ok(screenpipe_db::SpeakerEmbeddingMatch::Matched(speaker)) => Some(LiveSpeaker {
             id: speaker.id,
             name: Some(speaker.name).filter(|name| !name.trim().is_empty()),
         }),
-        Ok(None) => None,
+        Ok(_) => None,
         Err(e) => {
             debug!("meeting streaming: live speaker lookup failed: {}", e);
             None
