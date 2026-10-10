@@ -29,9 +29,15 @@ use crate::{
 };
 
 const LIVE_SAMPLE_RATE: u32 = 16_000;
-const LIVE_CHUNK_TARGET: Duration = Duration::from_secs(6);
+/// Hard cap: a chunk this long is cut even mid-speech.
+const LIVE_CHUNK_TARGET: Duration = Duration::from_secs(8);
 const LIVE_CHUNK_MIN: Duration = Duration::from_secs(2);
-const FLUSH_TICK: Duration = Duration::from_millis(750);
+/// How often the buffer is checked for a pause to cut on.
+const FLUSH_TICK: Duration = Duration::from_millis(250);
+/// The tail that must be quiet for a cut to count as "at a pause".
+const PAUSE_TAIL: Duration = Duration::from_millis(400);
+/// Tail energy, relative to the whole buffer, below which the speaker has paused.
+const PAUSE_RELATIVE_RMS: f32 = 0.35;
 const MIN_LIVE_RMS: f32 = 0.003;
 
 pub fn spawn_selected_engine_stream(
@@ -190,7 +196,10 @@ async fn ingest_loop(
                 }
             }
             _ = flush_tick.tick() => {
-                if buffer.duration() >= LIVE_CHUNK_MIN {
+                // Cut where the speaker pauses, not on the clock. Cutting every
+                // tick past the minimum made ~2 s chunks that end mid-word, one
+                // caption line each; a pause is a sentence or phrase boundary.
+                if buffer.duration() >= LIVE_CHUNK_MIN && ends_in_pause(&buffer.samples) {
                     hand_off(&mut buffer, &mailbox);
                 }
             }
@@ -198,6 +207,18 @@ async fn ingest_loop(
     }
 
     Ok(())
+}
+
+/// The last [`PAUSE_TAIL`] of the buffer is quiet, in absolute terms or next to
+/// the buffer as a whole. A buffer that is quiet throughout also counts, so
+/// silence is handed off (and dropped) instead of piling up ahead of speech.
+fn ends_in_pause(samples: &[f32]) -> bool {
+    let tail_len = (PAUSE_TAIL.as_secs_f32() * LIVE_SAMPLE_RATE as f32) as usize;
+    if samples.len() <= tail_len {
+        return false;
+    }
+    let tail = rms(&samples[samples.len() - tail_len..]);
+    tail < MIN_LIVE_RMS || tail < PAUSE_RELATIVE_RMS * rms(samples)
 }
 
 /// Take the buffered chunk and hand it to the mailbox, skipping silent audio so
@@ -541,6 +562,25 @@ fn emit_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cuts_wait_for_a_pause() {
+        let tone = |secs: f32, amp: f32| -> Vec<f32> {
+            (0..(secs * LIVE_SAMPLE_RATE as f32) as usize)
+                .map(|i| amp * (i as f32 * 0.05).sin())
+                .collect()
+        };
+        // Still talking: no cut.
+        assert!(!ends_in_pause(&tone(3.0, 0.2)));
+        // Speech then half a second of near-silence: cut.
+        let mut paused = tone(3.0, 0.2);
+        paused.extend(tone(0.5, 0.004));
+        assert!(ends_in_pause(&paused));
+        // Quiet throughout: handed off so it does not pile up (the gates drop it).
+        assert!(ends_in_pause(&vec![0.0; 2 * LIVE_SAMPLE_RATE as usize]));
+        // Shorter than the tail window: not enough to judge.
+        assert!(!ends_in_pause(&tone(0.2, 0.2)));
+    }
 
     #[tokio::test]
     async fn voice_gate_drops_room_noise_level_audio() {
