@@ -302,6 +302,77 @@ mod tests {
         assert_eq!(attempts, 0);
     }
 
+    /// Retranscribe found nothing worth keeping in a chunk that already had
+    /// text. `Silent` alone leaves a transcribed chunk and its rows in place;
+    /// the explicit clear removes the rows and flips the status together.
+    #[tokio::test]
+    async fn clear_as_silent_deletes_rows_and_marks_a_transcribed_chunk_silent() {
+        let db = setup_test_db().await;
+        let ts = Utc::now() - Duration::minutes(20);
+        let chunk = db.insert_audio_chunk("a.mp4", Some(ts)).await.unwrap();
+        let other = db.insert_audio_chunk("b.mp4", Some(ts)).await.unwrap();
+        for id in [chunk, other] {
+            db.replace_audio_transcription(id, "嗯", "test", "Mic", true, ts, Some(1.0), None)
+                .await
+                .unwrap();
+        }
+
+        db.record_chunk_outcome(chunk, ChunkOutcome::Silent)
+            .await
+            .unwrap();
+        assert_eq!(chunk_status(&db, chunk).await.0, "transcribed");
+        assert_eq!(transcription_count(&db, chunk).await, 1);
+
+        db.clear_audio_transcriptions_as_silent(chunk)
+            .await
+            .unwrap();
+        assert_eq!(chunk_status(&db, chunk).await.0, "silent");
+        assert_eq!(transcription_count(&db, chunk).await, 0);
+
+        assert_eq!(chunk_status(&db, other).await.0, "transcribed");
+        assert_eq!(transcription_count(&db, other).await, 1);
+    }
+
+    /// Both chunk queries report the file start even when a transcription
+    /// row carries a different time.
+    #[tokio::test]
+    async fn chunk_queries_return_the_file_start_timestamp() {
+        let db = setup_test_db().await;
+        let file_start = Utc::now() - Duration::minutes(20);
+        let chunk = db
+            .insert_audio_chunk("a.mp4", Some(file_start))
+            .await
+            .unwrap();
+        db.replace_audio_transcription(
+            chunk,
+            "hello",
+            "test",
+            "Mic",
+            true,
+            file_start + Duration::seconds(17),
+            Some(1.0),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let by_id = db.get_audio_chunks_by_ids(&[chunk]).await.unwrap();
+        let in_range = db
+            .get_audio_chunks_in_range(
+                file_start - Duration::minutes(1),
+                file_start + Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+        for rows in [by_id, in_range] {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].timestamp.timestamp_millis(),
+                file_start.timestamp_millis()
+            );
+        }
+    }
+
     /// The 2026-05-20 zombie-loop regression. Reconciliation picks an
     /// orphan chunk → STT returns empty → old helper no-op'd the silent
     /// mark → next sweep picks the SAME chunk → forever. This test locks

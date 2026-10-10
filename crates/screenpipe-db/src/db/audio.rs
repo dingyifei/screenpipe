@@ -824,6 +824,35 @@ impl DatabaseManager {
         }
     }
 
+    /// Delete every transcription row of a chunk and mark it silent, in one TX.
+    /// Used by the re-transcribe endpoint when a fresh pass keeps nothing:
+    /// `record_chunk_outcome(Silent)` deliberately leaves a transcribed chunk
+    /// and its rows alone, which here would keep the text being replaced.
+    pub async fn clear_audio_transcriptions_as_silent(
+        &self,
+        audio_chunk_id: i64,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query("DELETE FROM audio_transcriptions WHERE audio_chunk_id = ?1")
+            .bind(audio_chunk_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        sqlx::query(
+            "UPDATE audio_chunks \
+             SET transcription_status = 'silent', \
+                 transcription_attempts = transcription_attempts + 1, \
+                 last_transcription_attempt_at = ?1, \
+                 transcription_failure_reason = NULL \
+             WHERE id = ?2",
+        )
+        .bind(Utc::now())
+        .bind(audio_chunk_id)
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Mark a chunk as pending for re-transcription. Used by the retranscribe
     /// endpoint to opt a meeting back into reconciliation with a different
     /// engine. Existing rows are kept so the UI doesn't flash empty —
@@ -933,6 +962,7 @@ impl DatabaseManager {
 
     /// Get audio chunks and their transcriptions within a time range.
     /// Used by the re-transcribe endpoint to find audio files to re-process.
+    /// `timestamp` is the chunk's file start, not a transcription row's time.
     pub async fn get_audio_chunks_in_range(
         &self,
         start: DateTime<Utc>,
@@ -940,7 +970,7 @@ impl DatabaseManager {
     ) -> Result<Vec<AudioChunkInfo>, sqlx::Error> {
         let rows = sqlx::query_as::<_, AudioChunkInfo>(
             r#"SELECT ac.id, ac.file_path, at.transcription, at.transcription_engine,
-                      at.offset_index, COALESCE(at.timestamp, ac.timestamp) as timestamp,
+                      at.offset_index, ac.timestamp as timestamp,
                       at.device, at.is_input_device
                FROM audio_chunks ac
                LEFT JOIN audio_transcriptions at ON ac.id = at.audio_chunk_id
@@ -990,7 +1020,7 @@ impl DatabaseManager {
         let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i)).collect();
         let sql = format!(
             r#"SELECT ac.id, ac.file_path, at.transcription, at.transcription_engine,
-                      at.offset_index, COALESCE(at.timestamp, ac.timestamp) as timestamp,
+                      at.offset_index, ac.timestamp as timestamp,
                       at.device, at.is_input_device
                FROM audio_chunks ac
                LEFT JOIN audio_transcriptions at ON ac.id = at.audio_chunk_id
