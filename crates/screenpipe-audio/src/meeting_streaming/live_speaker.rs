@@ -57,6 +57,10 @@ pub fn install_live_speaker_identifier(
 /// 1.5 s segment was seen matching a named speaker it did not belong to.
 const MIN_LIVE_IDENTIFY_SECS: f64 = 2.0;
 
+/// A segment this long counts as a voice of its own when deciding whether a
+/// cut holds more than one speaker.
+const MIN_VOICE_SECS: f64 = 1.0;
+
 /// Size of the per-pass scratch cluster table; one chunk holds a few voices at most.
 const SCRATCH_SPEAKERS: usize = 8;
 
@@ -68,9 +72,9 @@ pub(crate) async fn new_live_vad() -> Option<LiveVad> {
     Some(Arc::new(tokio::sync::Mutex::new(Box::new(vad))))
 }
 
-/// The stored speaker whose voice dominates this chunk (16 kHz mono). `None`
-/// when the models are not ready, no segment is long enough, or nobody
-/// matches unambiguously.
+/// The stored speaker whose voice this chunk is (16 kHz mono). `None` when the
+/// models are not ready, no segment is long enough, the chunk holds more than
+/// one voice, or nobody matches unambiguously.
 ///
 /// The chunk goes through the batch path's own preparation
 /// (`prepare_segments`: normalization, VAD, speaker segmentation, one
@@ -113,13 +117,22 @@ pub(crate) async fn identify(
         return None;
     }
     let mut best: Option<crate::speaker::segment::SpeechSegment> = None;
+    let mut voices = std::collections::HashSet::new();
     while let Some(segment) = receiver.recv().await {
+        if segment.end - segment.start >= MIN_VOICE_SECS {
+            voices.insert(segment.speaker.clone());
+        }
         let longer = best
             .as_ref()
             .is_none_or(|b| segment.end - segment.start > b.end - b.start);
         if !segment.embedding.is_empty() && longer {
             best = Some(segment);
         }
+    }
+    // Two people in one cut: the line is one of them finishing and the other
+    // starting, and the longer voice would name the whole of it.
+    if voices.len() > 1 {
+        return None;
     }
     let best = best.filter(|b| b.end - b.start >= MIN_LIVE_IDENTIFY_SECS)?;
     match identifier

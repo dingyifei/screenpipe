@@ -115,6 +115,10 @@ pub struct MeetingLifecycleEvent {
     pub detection_source: Option<String>,
     #[serde(default)]
     pub timestamp: Option<DateTime<Utc>>,
+    /// Speech language asked for when the meeting was started by hand: a
+    /// language code, or "auto" for no hint. Absent means the configured one.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 impl MeetingLifecycleEvent {
@@ -183,6 +187,9 @@ pub struct MeetingTranscriptFinal {
     pub session_speaker_id: Option<String>,
     #[serde(default)]
     pub speaker_name: Option<String>,
+    /// The stored speaker this line was matched to by voice, named or not.
+    #[serde(default)]
+    pub speaker_id: Option<i64>,
     pub transcript: String,
     pub captured_at: DateTime<Utc>,
 }

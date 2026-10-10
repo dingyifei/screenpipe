@@ -477,6 +477,7 @@ fn emit_final(
             speaker_name.as_deref(),
         ),
         speaker_name,
+        speaker_id: None,
         transcript,
         captured_at,
     };

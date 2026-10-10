@@ -747,6 +747,7 @@ impl DatabaseManager {
             "legacy",
             None,
             speaker_name,
+            None,
             transcript,
             captured_at,
         )
@@ -765,6 +766,7 @@ impl DatabaseManager {
         stream_id: &str,
         session_speaker_id: Option<&str>,
         speaker_name: Option<&str>,
+        speaker_id: Option<i64>,
         transcript: &str,
         captured_at: DateTime<Utc>,
     ) -> Result<i64, SqlxError> {
@@ -776,8 +778,8 @@ impl DatabaseManager {
         let mut tx = self.begin_immediate_with_retry().await?;
         let result = sqlx::query(
             "INSERT OR IGNORE INTO meeting_transcript_segments \
-             (meeting_id, provider, model, item_id, device_name, device_type, stream_id, session_speaker_id, speaker_name, transcript, captured_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             (meeting_id, provider, model, item_id, device_name, device_type, stream_id, session_speaker_id, speaker_name, speaker_id, transcript, captured_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(meeting_id)
         .bind(provider)
@@ -788,6 +790,7 @@ impl DatabaseManager {
         .bind(stream_id)
         .bind(session_speaker_id)
         .bind(speaker_name)
+        .bind(speaker_id)
         .bind(trimmed)
         .bind(captured_at.to_rfc3339())
         .execute(&mut **tx.conn())
