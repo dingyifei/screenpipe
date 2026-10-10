@@ -853,6 +853,21 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Where the last transcription row of a chunk ends, in seconds from the
+    /// chunk's start. Past the file's length when a sentence was joined with
+    /// the start of the next file and stored here.
+    pub async fn audio_transcription_max_end_time(
+        &self,
+        audio_chunk_id: i64,
+    ) -> Result<Option<f64>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT MAX(end_time) FROM audio_transcriptions WHERE audio_chunk_id = ?1",
+        )
+        .bind(audio_chunk_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     /// Mark a chunk as pending for re-transcription. Used by the retranscribe
     /// endpoint to opt a meeting back into reconciliation with a different
     /// engine. Existing rows are kept so the UI doesn't flash empty —

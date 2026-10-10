@@ -38,8 +38,10 @@ const MIN_CORRELATION: f32 = 0.6;
 const LOUDER_MARGIN_DB: f32 = 1.0;
 /// Spans shorter than this are widened: a correlation over a few frames means little.
 const MIN_SPAN_FRAMES: usize = 2 * ENVELOPE_FPS;
-/// Share of this line's character pairs that must appear in the other mic's text.
-const MIN_TEXT_COVERAGE: f32 = 0.7;
+/// Share of this line's character pairs that must appear in the other mic's
+/// text. Two passes over one sentence differ by a homophone here and there
+/// (它/他), and in a short line one such character costs two pairs.
+const MIN_TEXT_COVERAGE: f32 = 0.6;
 
 /// Log energy per 20 ms frame, in dBFS, floored at [`FLOOR_DB`]. A trailing
 /// partial frame is dropped.
@@ -290,6 +292,7 @@ mod tests {
             "可以用的东西，而且它的性能还不错。"
         ));
         assert!(text_covered("虽然你看他现在。", "虽然你看，他现在。"));
+        assert!(text_covered("虽然你看，它现在。", "虽然你看，他现在。"));
     }
 
     #[test]
