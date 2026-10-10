@@ -1409,9 +1409,13 @@ impl AudioManager {
             options.transcription_engine.as_ref(),
             options.openai_compatible_config.as_ref(),
         );
-        let languages = options.languages.clone();
         let vocabulary = options.vocabulary.clone();
         drop(options);
+        // No language hint for live cuts. The batch path pins one so a long
+        // mixed-language chunk is not translated, but on a two-second cut a
+        // pinned language makes the model force that language onto whatever it
+        // hears ("so" becomes "所以"); left to itself it picks per cut.
+        let languages = Vec::new();
 
         let Some(openai_compatible_config) = fallback else {
             return self.engine.clone();
