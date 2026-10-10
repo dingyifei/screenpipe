@@ -50,11 +50,17 @@ impl SilenceGate {
         let vad = match create_vad_engine(VadEngineEnum::Silero).await {
             Ok(v) => Some(v),
             Err(e) => {
-                warn!("retranscribe: silero vad unavailable ({}), trying webrtc", e);
+                warn!(
+                    "retranscribe: silero vad unavailable ({}), trying webrtc",
+                    e
+                );
                 match create_vad_engine(VadEngineEnum::WebRtc).await {
                     Ok(v) => Some(v),
                     Err(e) => {
-                        warn!("retranscribe: no vad available ({}), transcribing everything", e);
+                        warn!(
+                            "retranscribe: no vad available ({}), transcribing everything",
+                            e
+                        );
                         None
                     }
                 }
@@ -125,6 +131,20 @@ pub struct RetranscribeRequest {
     pub vocabulary: Option<Vec<VocabularyEntry>>,
     /// Custom prompt to guide transcription (used as Whisper initial_prompt)
     pub prompt: Option<String>,
+    /// Cut each chunk into speech segments, transcribe each one and attribute
+    /// it to a speaker by voice (the live path's VAD + segmentation +
+    /// embedding). Off by default: one transcription per chunk, no speaker.
+    #[serde(default)]
+    pub speakers: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RetranscribeSegmentResult {
+    /// Seconds from the start of the chunk.
+    pub start: f64,
+    pub end: f64,
+    pub speaker_id: Option<i64>,
+    pub text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +152,109 @@ pub struct RetranscribeChunkResult {
     pub audio_chunk_id: i64,
     pub old_text: Option<String>,
     pub new_text: String,
+    /// Per-speaker segments when the request asked for `speakers`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<RetranscribeSegmentResult>,
+}
+
+/// Transcribe one chunk segment by segment, with a speaker per segment.
+/// `None` means "fall back to one transcription for the whole chunk": no
+/// usable segments, or an STT failure part-way that would leave holes.
+async fn transcribe_speaker_segments(
+    state: &AppState,
+    vad: Arc<Mutex<Box<dyn VadEngine + Send>>>,
+    session: &mut screenpipe_audio::transcription::engine::TranscriptionSession,
+    samples: &[f32],
+    sample_rate: u32,
+    device_name: &str,
+    is_output_device: bool,
+    chunk_id: i64,
+) -> Option<Vec<RetranscribeSegmentResult>> {
+    let resampled;
+    let samples_16k: &[f32] = if sample_rate == 16000 {
+        samples
+    } else {
+        match screenpipe_audio::resample(samples, sample_rate, 16000) {
+            Ok(r) => {
+                resampled = r;
+                &resampled
+            }
+            Err(e) => {
+                warn!(
+                    "retranscribe: resample failed for chunk {}: {}",
+                    chunk_id, e
+                );
+                return None;
+            }
+        }
+    };
+    let segments = match state
+        .audio_manager
+        .speech_segments(samples_16k, vad, device_name, is_output_device)
+        .await
+    {
+        Ok(segments) if !segments.is_empty() => segments,
+        Ok(_) => return None,
+        Err(e) => {
+            warn!(
+                "retranscribe: speaker segmentation failed for chunk {}: {}",
+                chunk_id, e
+            );
+            return None;
+        }
+    };
+
+    let mut results = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let text = match session
+            .transcribe(&segment.samples, segment.sample_rate, device_name)
+            .await
+        {
+            Ok(text) => text.trim().to_string(),
+            Err(e) => {
+                warn!(
+                    "retranscribe: STT failed for a segment of chunk {}: {}",
+                    chunk_id, e
+                );
+                return None;
+            }
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let duration = (segment.end - segment.start).max(0.0);
+        let speaker_id = if segment.embedding.is_empty() {
+            None
+        } else {
+            match screenpipe_audio::transcription::get_or_create_speaker_from_embedding(
+                &state.db,
+                &segment.embedding,
+                duration,
+            )
+            .await
+            {
+                Ok(speaker) => speaker.map(|s| s.id),
+                Err(e) => {
+                    warn!(
+                        "retranscribe: speaker lookup failed for chunk {}: {}",
+                        chunk_id, e
+                    );
+                    None
+                }
+            }
+        };
+        results.push(RetranscribeSegmentResult {
+            start: segment.start.max(0.0),
+            end: segment.end.max(segment.start),
+            speaker_id,
+            text,
+        });
+    }
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -406,6 +529,11 @@ pub async fn retranscribe_handler(
     // 2. Get transcription config from audio manager
     let audio_manager = &state.audio_manager;
     let vocabulary = request.vocabulary.unwrap_or_default();
+    let speaker_vad = if request.speakers {
+        Some(audio_manager.detached_vad().await)
+    } else {
+        None
+    };
 
     // Resolve engine
     let engine = if let Some(ref engine_str) = request.engine {
@@ -519,6 +647,69 @@ pub async fn retranscribe_handler(
         };
 
         let device_name = chunk.device.as_deref().unwrap_or("unknown");
+        let old_text = chunk.transcription.clone();
+        let is_input = chunk.is_input_device.unwrap_or(false);
+        let engine_name = engine.to_string();
+        let timestamp = chunk.timestamp;
+        let duration_secs = samples.len() as f64 / sample_rate as f64;
+
+        // Speaker path: one row per speech segment, each with its speaker.
+        // Any failure falls through to the single-row path below.
+        if let Some(vad) = speaker_vad.clone() {
+            if let Some(segments) = transcribe_speaker_segments(
+                &state,
+                vad,
+                &mut session,
+                &samples,
+                sample_rate,
+                device_name,
+                is_output_device,
+                chunk.id,
+            )
+            .await
+            {
+                let rows: Vec<screenpipe_db::ReplacementAudioTranscription> = segments
+                    .iter()
+                    .map(|s| screenpipe_db::ReplacementAudioTranscription {
+                        transcription: s.text.clone(),
+                        speaker_id: s.speaker_id,
+                        start_time: s.start,
+                        end_time: s.end.min(duration_secs).max(s.start),
+                    })
+                    .collect();
+                if let Err(e) = state
+                    .db
+                    .replace_audio_transcriptions(
+                        chunk.id,
+                        &rows,
+                        &engine_name,
+                        device_name,
+                        is_input,
+                        timestamp,
+                    )
+                    .await
+                {
+                    error!(
+                        "failed to update transcription for chunk {}: {}",
+                        chunk.id, e
+                    );
+                    continue;
+                }
+                results.push(RetranscribeChunkResult {
+                    audio_chunk_id: chunk.id,
+                    old_text,
+                    new_text: segments
+                        .iter()
+                        .map(|s| s.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    segments,
+                });
+                processed += 1;
+                continue;
+            }
+        }
+
         let transcription = match session.transcribe(&samples, sample_rate, device_name).await {
             Ok(text) => text,
             Err(e) => {
@@ -528,11 +719,6 @@ pub async fn retranscribe_handler(
         };
 
         // Update DB — replace all existing transcription rows for this chunk
-        let old_text = chunk.transcription.clone();
-        let is_input = chunk.is_input_device.unwrap_or(false);
-        let engine_name = engine.to_string();
-        let timestamp = chunk.timestamp;
-        let duration_secs = samples.len() as f64 / sample_rate as f64;
         if let Err(e) = state
             .db
             .replace_audio_transcription(
@@ -558,6 +744,7 @@ pub async fn retranscribe_handler(
             audio_chunk_id: chunk.id,
             old_text,
             new_text: transcription,
+            segments: Vec::new(),
         });
         processed += 1;
     }
@@ -1060,6 +1247,30 @@ fn looks_like_capture_timestamp(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speakers_is_opt_in() {
+        let default: RetranscribeRequest =
+            serde_json::from_value(json!({"audio_chunk_ids": [1]})).unwrap();
+        assert!(!default.speakers);
+        let opted_in: RetranscribeRequest =
+            serde_json::from_value(json!({"audio_chunk_ids": [1], "speakers": true})).unwrap();
+        assert!(opted_in.speakers);
+    }
+
+    #[test]
+    fn segments_are_omitted_from_single_row_results() {
+        let single = RetranscribeChunkResult {
+            audio_chunk_id: 7,
+            old_text: None,
+            new_text: "hello".to_string(),
+            segments: Vec::new(),
+        };
+        assert!(serde_json::to_value(&single)
+            .unwrap()
+            .get("segments")
+            .is_none());
+    }
 
     fn chunk(id: i64, path: &str, seconds: i64) -> AudioChunkInfo {
         AudioChunkInfo {

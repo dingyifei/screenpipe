@@ -8,10 +8,10 @@ use screenpipe_audio::core::engine::AudioTranscriptionEngine;
 use screenpipe_audio::meeting_streaming::MeetingStreamingConfig;
 use screenpipe_audio::transcription::deepgram::DeepgramTranscriptionConfig;
 use screenpipe_audio::transcription::VocabularyEntry;
+use screenpipe_audio::vad::VadEngineEnum;
 use screenpipe_audio::{
     OpenAICompatibleConfig, DEFAULT_OPENAI_COMPATIBLE_ENDPOINT, DEFAULT_OPENAI_COMPATIBLE_MODEL,
 };
-use screenpipe_audio::vad::VadEngineEnum;
 use screenpipe_config::{ChannelConfig, DbConfig, DomainRule, SemanticContextMode, UrlRule};
 use screenpipe_core::Language;
 use screenpipe_screen::PipelineMetrics;
