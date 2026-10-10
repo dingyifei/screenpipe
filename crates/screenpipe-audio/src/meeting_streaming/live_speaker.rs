@@ -52,8 +52,10 @@ pub fn install_live_speaker_identifier(
     let _ = IDENTIFIER.set(Identifier { segmentation, db });
 }
 
-/// Speech segments shorter than this are not matched at all.
-const MIN_LIVE_IDENTIFY_SECS: f64 = 1.0;
+/// Speech segments shorter than this are not matched at all. Stricter than
+/// the batch path's 1 s: a wrong name on a live line is worse than none, and a
+/// 1.5 s segment was seen matching a named speaker it did not belong to.
+const MIN_LIVE_IDENTIFY_SECS: f64 = 2.0;
 
 /// Size of the per-pass scratch cluster table; one chunk holds a few voices at most.
 const SCRATCH_SPEAKERS: usize = 8;
