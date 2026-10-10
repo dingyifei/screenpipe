@@ -7,6 +7,12 @@ use crate::SpeakerEmbeddingMatch;
 use crate::{ReassignScope, SpeakerReassignment};
 use sqlx::AssertSqlSafe;
 
+/// The local calendar day stamped on new unnamed speakers and used to scope
+/// matching to them.
+pub fn speaker_day_today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
 /// Every table carrying a `speakers.id`. A speaker may only be deleted once
 /// all of them are clear: dropping the row while rows still point at it is
 /// what stranded thousands of transcript lines in the field, rendered as a
@@ -128,10 +134,14 @@ impl DatabaseManager {
         let mut tx = self.begin_immediate_with_retry().await?;
 
         let bytes: &[u8] = embedding.as_bytes();
+        // Stamp the local day: an unnamed speaker is only a match candidate on
+        // the day it was created (see `match_speaker_from_embedding`).
         let id = sqlx::query(
-            "INSERT INTO speakers (name, centroid, embedding_count) VALUES (NULL, vec_f32(?1), 1)",
+            "INSERT INTO speakers (name, centroid, embedding_count, metadata)
+             VALUES (NULL, vec_f32(?1), 1, json_object('day', ?2))",
         )
         .bind(bytes)
+        .bind(speaker_day_today())
         .execute(&mut **tx.conn())
         .await?
         .last_insert_rowid();
@@ -197,9 +207,25 @@ impl DatabaseManager {
     /// `get_speaker_from_embedding` retains its historical nearest-neighbour
     /// behaviour for read-only callers. Identity writers use this richer result
     /// and abstain when the runner-up is too close.
+    ///
+    /// Candidates are day-scoped: named speakers always, unnamed speakers only
+    /// on the local day they were created. Unnamed voices pile up (a video, a
+    /// one-off call) and, left in the pool, sit so close to each other that the
+    /// runner-up margin makes every match abstain. Naming a speaker is what
+    /// carries it across days.
     pub async fn match_speaker_from_embedding(
         &self,
         embedding: &[f32],
+    ) -> Result<SpeakerEmbeddingMatch, SqlxError> {
+        self.match_speaker_from_embedding_on(embedding, &speaker_day_today())
+            .await
+    }
+
+    /// [`Self::match_speaker_from_embedding`] for an explicit day (`YYYY-MM-DD`).
+    pub async fn match_speaker_from_embedding_on(
+        &self,
+        embedding: &[f32],
+        day: &str,
     ) -> Result<SpeakerEmbeddingMatch, SqlxError> {
         let bytes: &[u8] = embedding.as_bytes();
 
@@ -212,6 +238,8 @@ impl DatabaseManager {
                         MIN(vec_distance_cosine(se.embedding, vec_f32(?1))) AS distance
                  FROM speaker_embeddings se
                  JOIN speakers s ON s.id = se.speaker_id
+                 WHERE COALESCE(s.name, '') != ''
+                    OR (json_valid(s.metadata) AND json_extract(s.metadata, '$.day') = ?2)
                  GROUP BY s.id, s.name, s.metadata
              )
              SELECT id, name, metadata, distance
@@ -220,6 +248,7 @@ impl DatabaseManager {
              LIMIT 2",
         )
         .bind(bytes)
+        .bind(day)
         .fetch_all(&self.pool)
         .await?;
 
@@ -234,10 +263,13 @@ impl DatabaseManager {
                     vec_distance_cosine(centroid, vec_f32(?1)) AS distance
              FROM speakers
              WHERE centroid IS NOT NULL
+               AND (COALESCE(name, '') != ''
+                    OR (json_valid(metadata) AND json_extract(metadata, '$.day') = ?2))
              ORDER BY distance, id
              LIMIT 2",
         )
         .bind(bytes)
+        .bind(day)
         .fetch_all(&self.pool)
         .await?;
 
