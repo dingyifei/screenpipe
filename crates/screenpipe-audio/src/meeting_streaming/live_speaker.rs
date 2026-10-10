@@ -55,6 +55,9 @@ pub fn install_live_speaker_identifier(
 /// Speech segments shorter than this are not matched at all.
 const MIN_LIVE_IDENTIFY_SECS: f64 = 1.0;
 
+/// Size of the per-pass scratch cluster table; one chunk holds a few voices at most.
+const SCRATCH_SPEAKERS: usize = 8;
+
 /// A voice detector for one live stream's identification passes.
 pub(crate) type LiveVad = Arc<tokio::sync::Mutex<Box<dyn crate::vad::VadEngine + Send>>>;
 
@@ -73,9 +76,10 @@ pub(crate) async fn new_live_vad() -> Option<LiveVad> {
 /// Embedding the raw chunk instead matched two different voices to the same
 /// stored speaker.
 ///
-/// Read-only on the speaker store, on purpose: live audio must not create
-/// speakers or update a stored profile; only the batch path writes there. A
-/// new voice therefore gets its live label once that path has created it.
+/// Read-only, on purpose: live audio must not create speakers, update a stored
+/// profile, or add to the live pipeline's in-memory cluster table. Only the
+/// batch path writes speaker state. A new voice therefore gets its live label
+/// once that path has created it.
 pub(crate) async fn identify(
     samples_16k: &[f32],
     vad: LiveVad,
@@ -90,7 +94,12 @@ pub(crate) async fn identify(
         samples_16k,
         vad,
         model_path.as_ref(),
-        segmentation.embedding_manager.clone(),
+        // A throwaway cluster table: `prepare_segments` records every voice it
+        // sees in the manager it is given, and the live pipeline's own table
+        // must not pick up entries from these passes.
+        Arc::new(std::sync::Mutex::new(
+            crate::speaker::embedding_manager::EmbeddingManager::new(SCRATCH_SPEAKERS),
+        )),
         Some(extractor),
         device_name,
         is_output_device,
