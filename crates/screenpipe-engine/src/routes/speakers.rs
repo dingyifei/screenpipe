@@ -351,6 +351,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn teaching_keeps_only_what_was_said_inside_the_range() {
+        let secs = |n: f64| (n * 16000.0) as usize;
+        // Wholly inside: untouched.
+        assert_eq!(
+            clip_to_range(2.0, 5.0, secs(3.0), 20.0),
+            Some((0..secs(3.0), 2.0, 5.0))
+        );
+        // Began three seconds before the range: those three seconds are dropped.
+        assert_eq!(
+            clip_to_range(-3.0, 4.0, secs(7.0), 20.0),
+            Some((secs(3.0)..secs(7.0), 0.0, 4.0))
+        );
+        // Ran on past the end.
+        assert_eq!(
+            clip_to_range(18.0, 25.0, secs(7.0), 20.0),
+            Some((0..secs(2.0), 18.0, 20.0))
+        );
+        // Covers the whole range and more on both sides.
+        assert_eq!(
+            clip_to_range(-5.0, 30.0, secs(35.0), 20.0),
+            Some((secs(5.0)..secs(25.0), 0.0, 20.0))
+        );
+        // Outside, before and after.
+        assert_eq!(clip_to_range(-6.0, -1.0, secs(5.0), 20.0), None);
+        assert_eq!(clip_to_range(20.0, 24.0, secs(4.0), 20.0), None);
+        // Fewer samples than the times claim: never out of bounds.
+        let (range, _, _) = clip_to_range(-3.0, 4.0, secs(5.0), 20.0).unwrap();
+        assert_eq!(range, secs(3.0)..secs(5.0));
+    }
+
+    #[test]
     fn speaker_sample_duration_accepts_full_recording_chunk() {
         assert_eq!(validate_speaker_sample_duration(0.0, 30.0).unwrap(), 30.0);
     }
@@ -515,6 +546,25 @@ const TEACH_SECOND_VOICE_SHARE: f64 = 0.3;
 /// The longest stretch of recording a teaching request may name.
 const TEACH_MAX_RANGE_SECS: i64 = 180;
 
+/// The part of a speech segment that lies inside a teaching range. `start` and
+/// `end` are the segment's seconds from the start of the range (so they may be
+/// negative or past `span`), and `samples_len` its length at 16 kHz. Returns
+/// the samples to keep and the clipped times, or `None` when nothing is inside.
+fn clip_to_range(
+    start: f64,
+    end: f64,
+    samples_len: usize,
+    span: f64,
+) -> Option<(std::ops::Range<usize>, f64, f64)> {
+    let (from, to) = (start.max(0.0), end.min(span));
+    if to <= from || samples_len == 0 {
+        return None;
+    }
+    let at = |secs: f64| (((secs - start) * 16000.0).round().max(0.0) as usize).min(samples_len);
+    let range = at(from)..at(to);
+    (!range.is_empty()).then_some((range, from, to))
+}
+
 fn teach_error(status: StatusCode, message: &str) -> (StatusCode, JsonResponse<Value>) {
     (status, JsonResponse(json!({ "error": message })))
 }
@@ -586,11 +636,24 @@ pub(crate) async fn teach_speaker_handler(
         // Seconds from the start of the range, so pieces of consecutive files line up.
         let offset = (chunk.timestamp - request.start).num_milliseconds() as f64 / 1000.0;
         for segment in segments {
-            let (start, end) = (offset + segment.start, offset + segment.end);
-            if end <= 0.0 || start >= span as f64 || segment.sample_rate != 16000 {
+            if segment.sample_rate != 16000 {
                 continue;
             }
-            if let Some(voice) = state.audio_manager.voice_embedding(&segment.samples).await {
+            // Only what was said inside the range is learned or counted: a
+            // sentence that began before it, or ran on after it, is cut there.
+            let Some((inside, start, end)) = clip_to_range(
+                offset + segment.start,
+                offset + segment.end,
+                segment.samples.len(),
+                span as f64,
+            ) else {
+                continue;
+            };
+            if let Some(voice) = state
+                .audio_manager
+                .voice_embedding(&segment.samples[inside])
+                .await
+            {
                 by_device
                     .entry(device.name.clone())
                     .or_default()

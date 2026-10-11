@@ -568,7 +568,22 @@ async fn assign_speakers(
         .map(|group| group.and_then(|group| group_speaker[group]))
         .collect();
     let spans: Vec<(f64, f64)> = results.iter().map(|r| (r.start, r.end)).collect();
-    follow_neighbours(&spans, &mut speakers);
+    // A scrap follows the piece next to it, except where that would undo
+    // something known: the two were heard live as different voices, or the
+    // piece belongs to a voice with enough speech to be looked up that still
+    // came back unnamed. Such a voice is created when it matches nobody, so
+    // unnamed there means it sat between two stored people.
+    let refused: Vec<bool> = of
+        .iter()
+        .map(|group| group.is_some_and(|group| groups[group].secs >= GROUP_VOICE_SECS))
+        .collect();
+    follow_neighbours(&spans, &mut speakers, |piece, neighbour| {
+        let other_voice = matches!(
+            (&tracks.get(piece), &tracks.get(neighbour)),
+            (Some(Some(a)), Some(Some(b))) if a != b
+        );
+        !other_voice && !refused[piece]
+    });
     for (result, speaker) in results.iter_mut().zip(speakers) {
         result.speaker_id = speaker;
     }

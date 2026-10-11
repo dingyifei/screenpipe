@@ -2122,6 +2122,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recent_voice_is_not_hidden_behind_others_past_their_limit() {
+        let db = setup_test_db().await;
+        // Seven named voices 0.56 to 0.61 from the probe: past the general
+        // limit, so none of them is a match.
+        for step in 0..7 {
+            let other = db
+                .insert_speaker(&voice_at(64.0 + step as f32 * 0.45))
+                .await
+                .unwrap();
+            db.update_speaker_name(other.id, &format!("Other {step}"))
+                .await
+                .unwrap();
+        }
+        // A voice of this conversation a little further still, inside the looser limit.
+        let recent = db.insert_speaker(&voice_at(67.3)).await.unwrap();
+        db.update_speaker_name(recent.id, "Recent").await.unwrap();
+        let probe = voice_at(0.0);
+        match db
+            .match_speaker_from_embedding_recent(&probe, &[recent.id])
+            .await
+            .unwrap()
+        {
+            screenpipe_db::SpeakerEmbeddingMatch::Matched(speaker) => {
+                assert_eq!(speaker.id, recent.id)
+            }
+            other => panic!("expected the recent voice, got {other:?}"),
+        }
+        assert!(matches!(
+            db.match_speaker_from_embedding(&probe).await.unwrap(),
+            screenpipe_db::SpeakerEmbeddingMatch::NoMatch
+        ));
+    }
+
+    #[tokio::test]
     async fn a_second_teaching_is_kept_beside_the_first() {
         let db = setup_test_db().await;
         let me = db.insert_speaker(&voice_at(0.0)).await.unwrap();
