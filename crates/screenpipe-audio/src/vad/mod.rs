@@ -26,6 +26,15 @@ pub fn min_speech_ratio() -> f32 {
     f32::from_bits(MIN_SPEECH_RATIO_BITS.load(Ordering::Relaxed))
 }
 
+/// The threshold for work somebody asked for: a running session and a
+/// retranscribe request. The power manager pauses background transcription on
+/// a low battery by raising the threshold above (to 1.0 at 20%); a
+/// conversation the user started is not background work, and with the pause
+/// applied its microphone went dead and every file it sent came back silent.
+pub fn asked_for_min_speech_ratio() -> f32 {
+    min_speech_ratio().min(DEFAULT_MIN_SPEECH_RATIO)
+}
+
 /// Set the minimum speech ratio threshold (called by power manager).
 /// Higher values = skip more marginal audio = less CPU for transcription.
 pub fn set_min_speech_ratio(ratio: f32) {

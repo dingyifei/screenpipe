@@ -494,7 +494,7 @@ impl VoiceGate {
     /// `true` when a preview is worth transcribing. Not announced: the finished cut will be.
     async fn hears_speech(&self, samples_16k: &[f32]) -> bool {
         match self.speech_ratio(samples_16k).await {
-            Some(ratio) => ratio > crate::vad::min_speech_ratio(),
+            Some(ratio) => ratio > crate::vad::asked_for_min_speech_ratio(),
             None => true,
         }
     }
@@ -511,7 +511,7 @@ impl VoiceGate {
         let Some(speech_ratio) = self.speech_ratio(samples_16k).await else {
             return true;
         };
-        let min_speech_ratio = crate::vad::min_speech_ratio();
+        let min_speech_ratio = crate::vad::asked_for_min_speech_ratio();
         let passed = speech_ratio > min_speech_ratio;
         let _ = screenpipe_events::send_event(
             "meeting_streaming_voice_gate",
