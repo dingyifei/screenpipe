@@ -225,6 +225,212 @@ const OTHER_MIC_FILES_KEPT: usize = 6;
 /// Audio taken either side of the matching span when asking what the other mic heard.
 const OTHER_MIC_TEXT_PAD_SECS: f64 = 0.3;
 
+/// A voice the tracker hears for this long in a file lifts the speech
+/// detector's verdict on it (the live gate's `VOICED_PASS_MS`).
+const SUNG_MIN_SECS: f64 = 1.0;
+/// A stretch of voice no segment covers is added as pieces no longer than this.
+const SUNG_PIECE_MAX_SECS: f64 = 8.0;
+/// System audio louder than this is sound, and this much of it in a stretch
+/// makes the stretch one the microphone may have picked up from the loudspeakers.
+const SOUNDING_DB: f32 = -50.0;
+const SOUNDING_SECS: f64 = 0.3;
+
+/// The sessions started from the live page (manual meetings) as `(start, end)`,
+/// newest first; an unfinished one ends now. Files inside one keep singing.
+async fn manual_sessions(state: &AppState) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    let meetings = match state.db.list_meetings(None, None, None, 200, 0).await {
+        Ok(meetings) => meetings,
+        Err(e) => {
+            warn!("retranscribe: could not list sessions: {}", e);
+            return Vec::new();
+        }
+    };
+    meetings
+        .iter()
+        .filter(|m| m.meeting_app == "manual")
+        .filter_map(|m| {
+            let start = parse_meeting_timestamp(&m.meeting_start).ok()?;
+            let end = match m.meeting_end.as_deref() {
+                Some(end) => parse_meeting_timestamp(end).ok()?,
+                None => Utc::now(),
+            };
+            Some((start, end))
+        })
+        .collect()
+}
+
+/// A 30-second file that starts up to half a minute before a session reaches into it.
+fn in_a_session(sessions: &[(DateTime<Utc>, DateTime<Utc>)], file_start: DateTime<Utc>) -> bool {
+    sessions.iter().any(|(start, end)| {
+        file_start >= *start - chrono::Duration::seconds(30) && file_start <= *end
+    })
+}
+
+/// What the system audio was doing over `[start, end]` seconds of a microphone
+/// file. `outputs` are the system-audio recordings around it, as (their start
+/// relative to the file's, their 20 ms loudness frames).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemAudio {
+    Quiet,
+    Sounding,
+    Unknown,
+}
+
+fn system_audio_over(outputs: &[(f64, Vec<f32>)], start: f64, end: f64) -> SystemAudio {
+    let fps = screenpipe_audio::same_utterance::ENVELOPE_FPS as f64;
+    let (mut known, mut sounding) = (0usize, 0usize);
+    for (offset, levels) in outputs {
+        let from = (((start - offset) * fps).floor().max(0.0)) as usize;
+        let to = (((end - offset) * fps).ceil().max(0.0) as usize).min(levels.len());
+        for level in levels.get(from..to).unwrap_or(&[]) {
+            known += 1;
+            if *level > SOUNDING_DB {
+                sounding += 1;
+            }
+        }
+    }
+    if sounding as f64 / fps >= SOUNDING_SECS {
+        SystemAudio::Sounding
+    } else if (known as f64) < (end - start) * fps * 0.8 {
+        SystemAudio::Unknown
+    } else {
+        SystemAudio::Quiet
+    }
+}
+
+/// The voiced stretches of a file that may lift the detector's verdict: all of
+/// them for system audio; for a microphone, those during which the system
+/// audio is known to be quiet (`outputs` of `None` is a microphone whose
+/// system audio could not be read, and nothing is eligible). `None` when what
+/// is left is under [`SUNG_MIN_SECS`]: the file then goes the ordinary way.
+fn eligible_voice(
+    voiced: Vec<(f64, f64)>,
+    is_input: bool,
+    outputs: Option<&[(f64, Vec<f32>)]>,
+) -> Option<Vec<(f64, f64)>> {
+    let kept: Vec<(f64, f64)> = if is_input {
+        let outputs = outputs?;
+        voiced
+            .into_iter()
+            .filter(|(start, end)| {
+                outputs.is_empty() || system_audio_over(outputs, *start, *end) == SystemAudio::Quiet
+            })
+            .collect()
+    } else {
+        voiced
+    };
+    let total: f64 = kept.iter().map(|(start, end)| end - start).sum();
+    (total >= SUNG_MIN_SECS).then_some(kept)
+}
+
+/// The parts of the voiced stretches that no segment covers, a second or more
+/// each and cut to at most [`SUNG_PIECE_MAX_SECS`].
+fn uncovered_voice(voiced: &[(f64, f64)], segments: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut pieces = Vec::new();
+    for &(start, end) in voiced {
+        let mut at = start;
+        let mut covering: Vec<(f64, f64)> = segments
+            .iter()
+            .copied()
+            .filter(|(a, b)| *b > start && *a < end)
+            .collect();
+        covering.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let mut gaps = Vec::new();
+        for (a, b) in covering {
+            if a > at {
+                gaps.push((at, a));
+            }
+            at = at.max(b);
+        }
+        if at < end {
+            gaps.push((at, end));
+        }
+        for (a, b) in gaps {
+            if b - a < SUNG_MIN_SECS {
+                continue;
+            }
+            let parts = ((b - a) / SUNG_PIECE_MAX_SECS).ceil().max(1.0) as usize;
+            let step = (b - a) / parts as f64;
+            pieces.extend((0..parts).map(|i| (a + i as f64 * step, a + (i + 1) as f64 * step)));
+        }
+    }
+    pieces
+}
+
+/// The system-audio recordings around a microphone file, for
+/// [`system_audio_over`]. `None` when one of them cannot be read: that is not
+/// silence. An empty list is a time with no system audio recorded at all.
+async fn system_audio_around(
+    state: &AppState,
+    chunk: &AudioChunkInfo,
+) -> Option<Vec<(f64, Vec<f32>)>> {
+    let window = chrono::Duration::seconds(OTHER_MIC_WINDOW_SECS);
+    let nearby = state
+        .db
+        .get_audio_chunks_in_range(chunk.timestamp - window, chunk.timestamp + window)
+        .await
+        .ok()?;
+    let mut seen = HashSet::new();
+    let mut outputs = Vec::new();
+    for file in nearby {
+        if !seen.insert(file.id) || retranscribe_chunk_device(&file).is_input {
+            continue;
+        }
+        let path = file.file_path.clone();
+        if !StdPath::new(&path).exists() {
+            return None;
+        }
+        let samples = tokio::task::spawn_blocking(move || {
+            screenpipe_audio::utils::ffmpeg::read_audio_from_file(StdPath::new(&path))
+        })
+        .await
+        .ok()?
+        .ok()?
+        .0;
+        let offset = (file.timestamp - chunk.timestamp).num_milliseconds() as f64 / 1000.0;
+        outputs.push((
+            offset,
+            screenpipe_audio::same_utterance::envelope_db(&samples, 16000),
+        ));
+    }
+    Some(outputs)
+}
+
+/// For a file inside a session: where the voice tracker hears a voice that may
+/// lift the speech detector's verdict, which does not count singing. `None`
+/// for every other file, and whenever that cannot be established (no helper,
+/// unreadable system audio): the file is then treated exactly as before.
+async fn sung_voice(
+    state: &AppState,
+    sessions: &[(DateTime<Utc>, DateTime<Utc>)],
+    chunk: &AudioChunkInfo,
+    samples_16k: &[f32],
+    is_input: bool,
+) -> Option<Vec<(f64, f64)>> {
+    if !in_a_session(sessions, chunk.timestamp) {
+        return None;
+    }
+    let power = samples_16k.iter().map(|s| s * s).sum::<f32>() / samples_16k.len().max(1) as f32;
+    if power.sqrt() < 0.003 {
+        return None;
+    }
+    let samples = samples_16k.to_vec();
+    let voiced = tokio::task::spawn_blocking(move || {
+        screenpipe_audio::meeting_streaming::voiced_in(&samples)
+    })
+    .await
+    .ok()??;
+    if voiced.iter().map(|(start, end)| end - start).sum::<f64>() < SUNG_MIN_SECS {
+        return None;
+    }
+    let outputs = if is_input {
+        system_audio_around(state, chunk).await
+    } else {
+        Some(Vec::new())
+    };
+    eligible_voice(voiced, is_input, outputs.as_deref())
+}
+
 /// The recording of another microphone that overlaps a chunk in time.
 struct OtherMicFile {
     chunk_id: i64,
@@ -650,6 +856,7 @@ async fn transcribe_speaker_segments(
     other_mics: &[(f64, OtherMicAudio)],
     chunk: &AudioChunkInfo,
     mut recent: Option<&mut Vec<i64>>,
+    sung: Option<&[(f64, f64)]>,
 ) -> Option<Vec<RetranscribeSegmentResult>> {
     let resampled;
     let samples_16k: &[f32] = if sample_rate == 16000 {
@@ -671,21 +878,69 @@ async fn transcribe_speaker_segments(
     };
     let covered = covered_by_previous(state, chunk, device_name).await;
     let chunk_secs = samples_16k.len() as f64 / 16000.0;
-    let segments = match state
+    // `sung`: the file holds a voice the detector does not count (see
+    // `sung_voice`). Its whole-file threshold is lifted, and stretches of that
+    // voice the segmenter still leaves out are added as pieces of their own.
+    // On this path nothing falls back to transcribing the file whole: an
+    // empty result is returned as such, and the caller leaves the rows alone.
+    let min_ratio = if sung.is_some() {
+        -1.0
+    } else {
+        screenpipe_audio::vad::asked_for_min_speech_ratio()
+    };
+    let found = state
         .audio_manager
-        .speech_segments(samples_16k, vad.clone(), device_name, is_output_device)
-        .await
-    {
-        Ok(segments) if !segments.is_empty() => segments,
-        Ok(_) => return None,
+        .speech_segments_above(
+            samples_16k,
+            vad.clone(),
+            device_name,
+            is_output_device,
+            min_ratio,
+        )
+        .await;
+    // (segment, added from the tracker's voice)
+    let mut segments: Vec<(screenpipe_audio::speaker::segment::SpeechSegment, bool)> = match found {
+        Ok(segments) => segments.into_iter().map(|s| (s, false)).collect(),
         Err(e) => {
             warn!(
                 "retranscribe: speaker segmentation failed for chunk {}: {}",
                 chunk_id, e
             );
-            return None;
+            if sung.is_none() {
+                return None;
+            }
+            Vec::new()
         }
     };
+    if let Some(voiced) = sung {
+        let spans: Vec<(f64, f64)> = segments.iter().map(|(s, _)| (s.start, s.end)).collect();
+        for (start, end) in uncovered_voice(voiced, &spans) {
+            let from = ((start * 16000.0) as usize).min(samples_16k.len());
+            let to = ((end * 16000.0) as usize).min(samples_16k.len());
+            if to <= from {
+                continue;
+            }
+            segments.push((
+                screenpipe_audio::speaker::segment::SpeechSegment {
+                    start,
+                    end,
+                    samples: samples_16k[from..to].to_vec(),
+                    speaker: String::new(),
+                    embedding: Vec::new(),
+                    sample_rate: 16000,
+                },
+                true,
+            ));
+        }
+        segments.sort_by(|a, b| a.0.start.total_cmp(&b.0.start));
+    }
+    if segments.is_empty() {
+        return if sung.is_some() {
+            Some(Vec::new())
+        } else {
+            None
+        };
+    }
 
     let levels = if other_mics.is_empty() {
         Vec::new()
@@ -696,7 +951,7 @@ async fn transcribe_speaker_segments(
     // One voice sample per kept segment, in step with `results`.
     let mut voices: Vec<Vec<f32>> = Vec::with_capacity(segments.len());
     let last = segments.len() - 1;
-    for (index, mut segment) in segments.into_iter().enumerate() {
+    for (index, (mut segment, added)) in segments.into_iter().enumerate() {
         match head_segment(segment.start, segment.end, covered) {
             HeadSegment::Keep => {}
             HeadSegment::Skip => continue,
@@ -819,7 +1074,12 @@ async fn transcribe_speaker_segments(
         // Who is speaking is decided below, for the file as a whole. The
         // sample is taken over the whole segment: the diarizer's own covers
         // its first two seconds.
-        let voice = if segment.sample_rate == 16000 {
+        // A piece admitted only because the tracker heard a voice is labelled
+        // from its neighbours and gives no voice sample: a song must not
+        // become part of what a named person sounds like.
+        let voice = if added {
+            Some(Vec::new())
+        } else if segment.sample_rate == 16000 {
             state.audio_manager.voice_embedding(&segment.samples).await
         } else {
             None
@@ -1247,6 +1507,14 @@ pub async fn retranscribe_handler(
     // Deduplicate chunks by ID (multiple transcription rows per chunk)
     let mut seen_ids = std::collections::HashSet::new();
     let mut other_mic_cache = std::collections::VecDeque::new();
+    // Files inside a session from the live page keep singing (`sung_voice`),
+    // whoever asks: the page, a rebuild or the nightly job, so none of them
+    // undoes another. Only with speakers, which is how all three ask.
+    let sessions = if speaker_vad.is_some() {
+        manual_sessions(&state).await
+    } else {
+        Vec::new()
+    };
 
     for chunk in &chunks {
         if !seen_ids.insert(chunk.id) {
@@ -1287,14 +1555,20 @@ pub async fn retranscribe_handler(
         let device_name = device.name.as_str();
         let is_input = device.is_input;
         let is_output_device = !is_input;
-        if silence_gate
-            .is_silent(
-                &samples,
-                sample_rate,
-                is_output_device,
-                &format!("chunk {}", chunk.id),
-            )
-            .await
+        let sung = if sample_rate == 16000 {
+            sung_voice(&state, &sessions, chunk, &samples, is_input).await
+        } else {
+            None
+        };
+        if sung.is_none()
+            && silence_gate
+                .is_silent(
+                    &samples,
+                    sample_rate,
+                    is_output_device,
+                    &format!("chunk {}", chunk.id),
+                )
+                .await
         {
             skipped_silent += 1;
             continue;
@@ -1340,9 +1614,16 @@ pub async fn retranscribe_handler(
                 &other_mics,
                 chunk,
                 recent_speakers.as_mut(),
+                sung.as_deref(),
             )
             .await
             {
+                // Nothing came of a file let through for its singing: what is
+                // stored for it stays; it was not found silent.
+                if segments.is_empty() && sung.is_some() {
+                    skipped_silent += 1;
+                    continue;
+                }
                 if segments.is_empty() {
                     if let Err(e) = state
                         .db
@@ -1401,6 +1682,13 @@ pub async fn retranscribe_handler(
                     segments,
                 });
                 processed += 1;
+                continue;
+            }
+            // The speaker path failed on a file let through for its singing.
+            // The whole-file path below is not for it: on a microphone that
+            // would transcribe everything the detector had held back.
+            if sung.is_some() {
+                failed.push(chunk.id);
                 continue;
             }
         }
@@ -1987,6 +2275,69 @@ mod tests {
         // Punctuation or digits only is not "non-Latin text".
         assert!(!is_only_non_latin("。"));
         assert!(!is_only_non_latin("123"));
+    }
+
+    #[test]
+    fn a_file_keeps_its_singing_only_inside_a_session() {
+        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        let sessions = vec![(at(100), at(400))];
+        assert!(in_a_session(&sessions, at(80))); // started before, reaches in
+        assert!(in_a_session(&sessions, at(399)));
+        assert!(!in_a_session(&sessions, at(60)));
+        assert!(!in_a_session(&sessions, at(401)));
+        assert!(!in_a_session(&[], at(200)));
+    }
+
+    #[test]
+    fn a_microphone_keeps_singing_only_where_system_audio_is_known_quiet() {
+        let voiced = vec![(2.0, 6.0), (12.0, 18.0)];
+        // System audio: everything the tracker heard.
+        assert_eq!(
+            eligible_voice(voiced.clone(), false, None),
+            Some(voiced.clone())
+        );
+        // A microphone with no system audio recorded at all.
+        assert_eq!(
+            eligible_voice(voiced.clone(), true, Some(&[])),
+            Some(voiced.clone())
+        );
+        // System audio that could not be read: nothing is eligible.
+        assert_eq!(eligible_voice(voiced.clone(), true, None), None);
+        // Quiet for the first stretch, sounding during the second.
+        let mut levels = vec![-90.0f32; 30 * 50];
+        levels[13 * 50..14 * 50].fill(-20.0);
+        let outputs = vec![(0.0, levels)];
+        assert_eq!(system_audio_over(&outputs, 2.0, 6.0), SystemAudio::Quiet);
+        assert_eq!(
+            system_audio_over(&outputs, 12.0, 18.0),
+            SystemAudio::Sounding
+        );
+        assert_eq!(
+            system_audio_over(&outputs, 28.0, 40.0),
+            SystemAudio::Unknown
+        );
+        assert_eq!(
+            eligible_voice(voiced, true, Some(&outputs)),
+            Some(vec![(2.0, 6.0)])
+        );
+        // Too little left to matter.
+        assert_eq!(eligible_voice(vec![(1.0, 1.5)], false, None), None);
+    }
+
+    #[test]
+    fn voice_no_segment_covers_becomes_pieces() {
+        // Wholly covered, partly covered, and a long stretch cut in two.
+        assert!(uncovered_voice(&[(1.0, 5.0)], &[(0.5, 5.5)]).is_empty());
+        assert_eq!(
+            uncovered_voice(&[(1.0, 9.0)], &[(0.0, 4.0)]),
+            vec![(4.0, 9.0)]
+        );
+        assert_eq!(
+            uncovered_voice(&[(0.0, 12.0)], &[]),
+            vec![(0.0, 6.0), (6.0, 12.0)]
+        );
+        // A gap under a second is not worth a piece.
+        assert!(uncovered_voice(&[(1.0, 5.0)], &[(1.0, 4.5)]).is_empty());
     }
 
     #[test]

@@ -779,6 +779,98 @@ fn live_extractor() -> Option<Extractor> {
     super::live_speaker::live_embedding_extractor()
 }
 
+/// How long one helper run over a file may take before it is given up on.
+const VOICED_IN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Where a voice is heard in a finished recording (16 kHz mono), as
+/// `(start, end)` in seconds: one run of the helper over the whole of it.
+/// `None` when the helper is not installed, fails or takes too long, which is
+/// "not known" and never "no voice". Blocks; call it off the async threads.
+///
+/// The live tracker's own memory is not used for this: it is kept per device
+/// name, outlives its session, and after a later session it would answer for
+/// the wrong recording.
+pub fn voiced_in(samples_16k: &[f32]) -> Option<Vec<(f64, f64)>> {
+    let (helper, model) = helper_paths()?;
+    let mut child = Command::new(&helper)
+        .arg(&model)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| warn!("voice tracks: could not start {}: {e}", helper.display()))
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let bytes: Vec<u8> = samples_16k.iter().flat_map(|s| s.to_le_bytes()).collect();
+    // Written from its own thread: the helper answers while it is still being fed.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&bytes);
+    });
+    let child = Arc::new(Mutex::new(Some(child)));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let watched = Arc::clone(&child);
+    std::thread::spawn(move || {
+        if done_rx.recv_timeout(VOICED_IN_TIMEOUT).is_err() {
+            if let Some(mut child) = watched.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    });
+    let mut active = Vec::new();
+    let (mut speakers, mut frame_secs) = (0usize, 0.0f64);
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("READY") => {
+                speakers = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                frame_secs = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            }
+            Some("F") if speakers > 0 => {
+                let hex = parts.nth(2).unwrap_or("");
+                let levels: Vec<u8> = (0..hex.len() / 2)
+                    .filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
+                    .collect();
+                active.extend(
+                    levels
+                        .chunks_exact(speakers)
+                        .map(|frame| frame.iter().any(|level| *level >= ACTIVE)),
+                );
+            }
+            _ => {}
+        }
+    }
+    let _ = writer.join();
+    let finished = done_tx.send(()).is_ok();
+    let exited = child
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .map(|mut child| child.wait().is_ok_and(|status| status.success()));
+    if !finished || exited != Some(true) || speakers == 0 || frame_secs <= 0.0 {
+        return None;
+    }
+    Some(voiced_stretches(&active, frame_secs))
+}
+
+/// Runs of active frames as `(start, end)` in seconds, a breath of up to
+/// [`SILENCE_FRAMES`] inside a run not ending it.
+fn voiced_stretches(active: &[bool], frame_secs: f64) -> Vec<(f64, f64)> {
+    let mut stretches: Vec<(usize, usize)> = Vec::new();
+    for (index, _) in active.iter().enumerate().filter(|(_, on)| **on) {
+        match stretches.last_mut() {
+            Some((_, end)) if index - *end <= SILENCE_FRAMES as usize => *end = index + 1,
+            _ => stretches.push((index, index + 1)),
+        }
+    }
+    stretches
+        .into_iter()
+        .map(|(start, end)| (start as f64 * frame_secs, end as f64 * frame_secs))
+        .collect()
+}
+
 /// The tracks that spoke on `device_name` between two times, for the pass that
 /// stores speakers. Empty when the device had no tracker.
 pub fn track_spans(device_name: &str, start_ms: u64, end_ms: u64) -> Vec<TrackSpan> {
@@ -918,6 +1010,19 @@ mod tests {
         assert_eq!(timeline.voiced_ms(1_000_000, 1_002_000), 1_000);
         assert_eq!(timeline.voiced_ms(1_000_500, 1_002_000), 500);
         assert_eq!(timeline.voiced_ms(1_001_000, 1_002_000), 0);
+    }
+
+    #[test]
+    fn voiced_stretches_join_across_a_breath_and_split_at_a_pause() {
+        let mut active = vec![false; 400];
+        active[10..100].fill(true);
+        active[120..200].fill(true); // 200 ms later: the same stretch
+        active[300..350].fill(true); // a second later: another
+        assert_eq!(
+            voiced_stretches(&active, 0.01),
+            vec![(0.1, 2.0), (3.0, 3.5)]
+        );
+        assert!(voiced_stretches(&[false; 50], 0.01).is_empty());
     }
 
     #[test]
