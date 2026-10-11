@@ -359,9 +359,11 @@ fn louder_mic_audio(
     })
 }
 
-/// A segment ending this close to the end of its file, or starting this close
-/// to the start, is a sentence the 30-second file boundary cut in two.
-const BOUNDARY_SECS: f64 = 0.3;
+/// Less than this much silence between the last speech of one file and the
+/// first of the next (the end of one plus the start of the other) means the
+/// 30-second file boundary cut a sentence in two. Segment edges sit a little
+/// inside the speech, so a cut sentence still shows a few tenths of a second.
+const BOUNDARY_SECS: f64 = 0.6;
 /// How much of the next file is looked at for the rest of such a sentence.
 const NEXT_HEAD_SECS: usize = 12;
 /// A joined sentence is at most this long, so a monologue is not chained on.
@@ -559,7 +561,7 @@ async fn transcribe_speaker_segments(
                     .ok()
                     .and_then(|segments| segments.into_iter().next())
                     .filter(|rest| {
-                        rest.start <= BOUNDARY_SECS
+                        (chunk_secs - segment.end) + rest.start <= BOUNDARY_SECS
                             && rest.sample_rate == 16000
                             && (segment.end - segment.start) + (rest.end - rest.start)
                                 <= JOINED_MAX_SECS
