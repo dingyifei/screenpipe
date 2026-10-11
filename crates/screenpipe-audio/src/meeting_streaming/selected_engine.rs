@@ -59,6 +59,8 @@ const MIC_CONTEXT: Duration = Duration::from_millis(500);
 /// How long a line that another mic heard louder waits for that mic's words.
 const MIC_HOLD: Duration = Duration::from_secs(6);
 const MIC_HOLD_POLL: Duration = Duration::from_millis(250);
+/// The longest a microphone line waits for the system audio to deal with the same span.
+const SYSTEM_AUDIO_HOLD: Duration = Duration::from_secs(12);
 /// Loudness history kept per microphone; a line is at most [`LIVE_CHUNK_TARGET`] long.
 const MIC_LEVELS_KEPT: Duration = Duration::from_secs(40);
 const MIC_LINES_KEPT: Duration = Duration::from_secs(40);
@@ -73,6 +75,72 @@ struct MicHistory {
     /// (capture time in ms, level in dB) per 20 ms frame.
     levels: VecDeque<(u64, f32)>,
     lines: VecDeque<MicLine>,
+    /// System audio, not a microphone.
+    is_output: bool,
+    /// Up to when this device's audio has been dealt with: cut, and then shown
+    /// as a line, held by the gate, found empty or silent. A line of another
+    /// device that waits for this one's words has nothing more to wait for
+    /// once this passes its end.
+    done_until_ms: u64,
+}
+
+/// What the system audio of a meeting was doing over a span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemAudio {
+    /// The meeting has no output device.
+    Absent,
+    Quiet,
+    Sounding,
+    /// Its loudness over the span is not (all) known.
+    Unknown,
+}
+
+/// Louder than this, a frame of system audio is sound and not silence ([`MIN_LIVE_RMS`] in dB).
+const SOUNDING_DB: f32 = -50.0;
+/// This much sound in a span makes the system audio count as sounding.
+const SOUNDING_MS: u64 = 300;
+
+/// What the system audio of `meeting_id` was doing over `[start_ms, end_ms]`.
+/// Sound is counted frame by frame, so a short burst in a long span counts;
+/// frames nobody captured are unknown, not silence.
+fn system_audio(meeting_id: i64, start_ms: u64, end_ms: u64) -> SystemAudio {
+    let table = mics();
+    let Some(meeting) = table.get(&meeting_id) else {
+        return SystemAudio::Absent;
+    };
+    let frames = (end_ms.saturating_sub(start_ms) / ENVELOPE_FRAME_MS).max(1);
+    let mut verdict = SystemAudio::Absent;
+    for output in meeting.values().filter(|device| device.is_output) {
+        let (mut known, mut sounding) = (0u64, 0u64);
+        for &(ms, db) in &output.levels {
+            if ms >= start_ms && ms <= end_ms {
+                known += 1;
+                if db > SOUNDING_DB {
+                    sounding += 1;
+                }
+            }
+        }
+        if sounding * ENVELOPE_FRAME_MS >= SOUNDING_MS {
+            return SystemAudio::Sounding;
+        }
+        // Most of the span must be on record before it can be called quiet.
+        verdict = if known * 5 >= frames * 4 && verdict != SystemAudio::Unknown {
+            SystemAudio::Quiet
+        } else {
+            SystemAudio::Unknown
+        };
+    }
+    verdict
+}
+
+/// Move a device's "dealt with" mark forward.
+fn mark_done(meeting_id: i64, device_name: &str, until_ms: u64) {
+    if let Some(device) = mics()
+        .get_mut(&meeting_id)
+        .and_then(|meeting| meeting.get_mut(device_name))
+    {
+        device.done_until_ms = device.done_until_ms.max(until_ms);
+    }
 }
 
 struct MicLine {
@@ -129,7 +197,7 @@ fn louder_mic(meeting_id: i64, device_name: &str, start_ms: u64, end_ms: u64) ->
     let mine = meeting.get(device_name)?.levels_from(from, frames);
     meeting
         .iter()
-        .filter(|(name, _)| name.as_str() != device_name)
+        .filter(|(name, other)| name.as_str() != device_name && !other.is_output)
         .find(|(name, other)| {
             let theirs = other.levels_from(from.saturating_sub(lag), frames + 2 * lag_frames);
             // Level mics: the one whose name sorts first keeps the line.
@@ -149,12 +217,14 @@ fn louder_mic(meeting_id: i64, device_name: &str, start_ms: u64, end_ms: u64) ->
 
 fn note_mic_line(meeting_id: i64, device_name: &str, line: MicLine) {
     let mut table = mics();
-    let lines = &mut table
-        .entry(meeting_id)
-        .or_default()
-        .entry(device_name.to_string())
-        .or_default()
-        .lines;
+    // A line shown after its stream ended must not bring the device back.
+    let Some(device) = table
+        .get_mut(&meeting_id)
+        .and_then(|meeting| meeting.get_mut(device_name))
+    else {
+        return;
+    };
+    let lines = &mut device.lines;
     let oldest = line
         .end_ms
         .saturating_sub(MIC_LINES_KEPT.as_millis() as u64);
@@ -178,6 +248,7 @@ fn forget_mic(meeting_id: i64, device_name: &str) {
 struct MicLevels {
     meeting_id: i64,
     device_name: String,
+    is_output: bool,
     /// Samples short of a whole frame, carried to the next call.
     carry: Vec<f32>,
 }
@@ -195,12 +266,13 @@ impl MicLevels {
             return;
         }
         let mut table = mics();
-        let history = &mut table
+        let device = table
             .entry(self.meeting_id)
             .or_default()
             .entry(self.device_name.clone())
-            .or_default()
-            .levels;
+            .or_default();
+        device.is_output = self.is_output;
+        let history = &mut device.levels;
         for (i, db) in levels.into_iter().enumerate() {
             history.push_back((first_ms + i as u64 * ENVELOPE_FRAME_MS, db));
         }
@@ -299,6 +371,7 @@ async fn run_stream(
     let mic_levels = Some(MicLevels {
         meeting_id,
         device_name: device_name.clone(),
+        is_output: device_type == "output",
         carry: Vec::new(),
     });
     let ingest = ingest_loop(
@@ -406,7 +479,7 @@ async fn ingest_loop(
                             buffer.push(tail, Utc::now().timestamp_millis() as u64);
                         }
                     }
-                    hand_off(&mut buffer, &mailbox);
+                    hand_off(&mut buffer, &mailbox, mic_levels.as_ref());
                     break;
                 };
 
@@ -423,7 +496,7 @@ async fn ingest_loop(
                 }
                 buffer.push(samples, frame.captured_at_unix_ms);
                 if buffer.duration() >= LIVE_CHUNK_TARGET {
-                    hand_off(&mut buffer, &mailbox);
+                    hand_off(&mut buffer, &mailbox, mic_levels.as_ref());
                     previewed = 0;
                 }
             }
@@ -450,7 +523,7 @@ async fn ingest_loop(
                     }
                     previewed = 0;
                 } else if buffer.duration() >= LIVE_CHUNK_MIN && ends_in_pause(&buffer.samples) {
-                    hand_off(&mut buffer, &mailbox);
+                    hand_off(&mut buffer, &mailbox, mic_levels.as_ref());
                     previewed = 0;
                 } else if live_previews && preview_due(buffer.samples.len(), previewed) {
                     if let Some(preview) = buffer.preview() {
@@ -487,24 +560,46 @@ fn preview_due(buffered: usize, previewed: usize) -> bool {
 
 /// Take the buffered chunk and hand it to the mailbox, skipping silent audio so
 /// a silent chunk never overwrites pending speech.
-fn hand_off(buffer: &mut LiveChunkBuffer, mailbox: &ChunkMailbox) {
+fn hand_off(buffer: &mut LiveChunkBuffer, mailbox: &ChunkMailbox, levels: Option<&MicLevels>) {
     let Some(chunk) = buffer.take() else {
         return;
     };
     if rms(&chunk.samples) < MIN_LIVE_RMS {
         debug!("meeting streaming: selected-engine live chunk was silent; skipping");
+        // Nothing will come of this audio: say so to whoever waits on it.
+        if let Some(levels) = levels {
+            mark_done(levels.meeting_id, &levels.device_name, chunk.end_ms());
+        }
         return;
     }
     mailbox.put(chunk);
 }
 
-/// How long the voice tracker heard somebody in a chunk; 0 when the device is not followed.
-fn voiced_ms(tracker: Option<&VoiceTracker>, chunk: &LiveChunk) -> u64 {
-    let end_ms =
-        chunk.captured_at_unix_ms + (chunk.samples.len() as u64 * 1000) / LIVE_SAMPLE_RATE as u64;
-    tracker.map_or(0, |tracker| {
-        tracker.voiced_ms(chunk.captured_at_unix_ms, end_ms)
-    })
+/// How long the voice tracker heard somebody in a chunk, for the speech gate;
+/// 0 when the device is not followed.
+///
+/// On a microphone the tracker also hears the loudspeakers from across the
+/// room, and passing that wrote every sentence of the other side a second
+/// time. So a microphone's count is used only while the system audio is known
+/// to be quiet (or the meeting has none): what the tracker hears then is in
+/// the room. A singer over music on headphones is not helped by this; the
+/// recorder cannot tell headphones from loudspeakers.
+fn voiced_ms(
+    tracker: Option<&VoiceTracker>,
+    chunk: &LiveChunk,
+    meeting_id: i64,
+    device_type: &str,
+) -> u64 {
+    let (start_ms, end_ms) = (chunk.captured_at_unix_ms, chunk.end_ms());
+    if device_type != "output"
+        && !matches!(
+            system_audio(meeting_id, start_ms, end_ms),
+            SystemAudio::Quiet | SystemAudio::Absent
+        )
+    {
+        return 0;
+    }
+    tracker.map_or(0, |tracker| tracker.voiced_ms(start_ms, end_ms))
 }
 
 /// Speech gate for live chunks: the same VAD criterion the batch path applies
@@ -549,12 +644,10 @@ impl VoiceGate {
         Some(crate::vad::speech_ratio(samples_16k, vad, self.is_output_device).await)
     }
 
-    /// The tracker's count passes a chunk of system audio only. On a
-    /// microphone it also hears the loudspeakers' sound from across the room,
-    /// which the detector rightly holds: passing that wrote every sentence of
-    /// the other side a second time.
+    /// A second of voice by the tracker's count passes a chunk by itself
+    /// (see [`voiced_ms`] for when a microphone's count is used at all).
     fn voiced(&self, voiced_ms: u64) -> bool {
-        self.is_output_device && voiced_ms >= VOICED_PASS_MS
+        voiced_ms >= VOICED_PASS_MS
     }
 
     /// `true` when a preview is worth transcribing. Not announced: the finished cut will be.
@@ -623,6 +716,7 @@ async fn transcribe_loop(
         mailbox.notify.notified().await;
         while let Some(chunk) = mailbox.take() {
             mailbox.busy.store(true, Ordering::SeqCst);
+            let finished_until = (!chunk.preview).then(|| chunk.end_ms());
             let outcome = if chunk.preview {
                 show_preview(
                     chunk,
@@ -641,7 +735,7 @@ async fn transcribe_loop(
             } else if !voice_gate
                 .passes(
                     &chunk.samples,
-                    voiced_ms(tracker.as_deref(), &chunk),
+                    voiced_ms(tracker.as_deref(), &chunk, meeting_id, &device_type),
                     meeting_id,
                     &device_name,
                     &device_type,
@@ -666,6 +760,11 @@ async fn transcribe_loop(
                 .await
             };
             mailbox.busy.store(false, Ordering::SeqCst);
+            // Shown, held or empty: this audio is dealt with. (A cut that a newer
+            // one replaced in the mailbox lies before it, so the mark covers it.)
+            if let Some(until_ms) = finished_until {
+                mark_done(meeting_id, &device_name, until_ms);
+            }
             outcome?;
         }
         if mailbox.is_closed() {
@@ -678,7 +777,7 @@ async fn transcribe_loop(
             || !voice_gate
                 .passes(
                     &chunk.samples,
-                    voiced_ms(tracker.as_deref(), &chunk),
+                    voiced_ms(tracker.as_deref(), &chunk, meeting_id, &device_type),
                     meeting_id,
                     &device_name,
                     &device_type,
@@ -732,7 +831,10 @@ async fn show_preview(
     model: Option<String>,
 ) {
     if !voice_gate
-        .hears_speech(&chunk.samples, voiced_ms(tracker, &chunk))
+        .hears_speech(
+            &chunk.samples,
+            voiced_ms(tracker, &chunk, meeting_id, device_type),
+        )
         .await
     {
         return;
@@ -740,7 +842,8 @@ async fn show_preview(
     let end_ms =
         chunk.captured_at_unix_ms + (chunk.samples.len() as u64 * 1000) / LIVE_SAMPLE_RATE as u64;
     if device_type == "input"
-        && louder_mic(meeting_id, device_name, chunk.captured_at_unix_ms, end_ms).is_some()
+        && (louder_mic(meeting_id, device_name, chunk.captured_at_unix_ms, end_ms).is_some()
+            || system_audio(meeting_id, chunk.captured_at_unix_ms, end_ms) == SystemAudio::Sounding)
     {
         return;
     }
@@ -952,11 +1055,15 @@ async fn transcribe_chunk(
     let louder = (device_type == "input")
         .then(|| louder_mic(meeting_id, device_name, chunk.captured_at_unix_ms, end_ms))
         .flatten();
-    match louder {
-        Some(other) => {
-            tokio::spawn(line.show_unless_said_on(other));
-        }
-        None => line.show(),
+    // The system audio was sounding too: on loudspeakers this line may be the
+    // other side heard across the room. (The loudness shapes of the two do not
+    // match reliably through a room, so sound alone is the trigger.)
+    let over_system_audio = device_type == "input"
+        && system_audio(meeting_id, chunk.captured_at_unix_ms, end_ms) == SystemAudio::Sounding;
+    if louder.is_some() || over_system_audio {
+        tokio::spawn(line.show_unless_said_elsewhere(louder, over_system_audio));
+    } else {
+        line.show();
     }
 
     Ok(())
@@ -995,32 +1102,68 @@ impl LiveLine {
         }
     }
 
-    /// Wait for `other_mic` to show this span, and drop the line if its words
-    /// are already there. That mic may cut the sentence elsewhere and answer
-    /// later; after [`MIC_HOLD`] without the words, the line is shown.
-    async fn show_unless_said_on(self, other_mic: String) {
-        let meeting_id = self.final_event.meeting_id;
+    /// Hold the line until the devices that may have said it first have had
+    /// their say, and drop it if its words are already there.
+    ///
+    /// `other_mic` heard the same sound louder: it may cut the sentence
+    /// elsewhere and answer later, so it is given [`MIC_HOLD`]. With
+    /// `system_audio` the wait is for the system audio to have dealt with the
+    /// span (its "done" mark passing the line's end), [`SYSTEM_AUDIO_HOLD`] at
+    /// most: a cut there can be [`LIVE_CHUNK_TARGET`] long and is transcribed
+    /// after it ends. Someone talking over a video is therefore shown as soon
+    /// as the system audio's cut has come back with other words, or with none.
+    /// A device that is gone (its stream ended) is not waited for.
+    async fn show_unless_said_elsewhere(self, other_mic: Option<String>, system_audio: bool) {
         let mut waited = Duration::ZERO;
         loop {
-            let theirs = mics()
-                .get(&meeting_id)
-                .and_then(|meeting| meeting.get(&other_mic))
-                .map(|mic| mic.text_near(self.span_ms.0, self.span_ms.1))
-                .unwrap_or_default();
-            if text_covered(&self.final_event.transcript, &theirs) {
+            let (said, wait) = self.said_elsewhere(other_mic.as_deref(), system_audio, waited);
+            if said {
                 debug!(
-                    "meeting streaming: line of {} already shown from {}; dropping",
-                    self.final_event.device_name, other_mic
+                    "meeting streaming: line of {} already shown from another device; dropping",
+                    self.final_event.device_name
                 );
                 return;
             }
-            if waited >= MIC_HOLD {
+            if !wait {
                 break;
             }
             tokio::time::sleep(MIC_HOLD_POLL).await;
             waited += MIC_HOLD_POLL;
         }
         self.show();
+    }
+
+    /// (the words are already shown from another device, it is still worth waiting)
+    fn said_elsewhere(
+        &self,
+        other_mic: Option<&str>,
+        system_audio: bool,
+        waited: Duration,
+    ) -> (bool, bool) {
+        let (start_ms, end_ms) = self.span_ms;
+        let lag = MIC_LAG.as_millis() as u64;
+        let table = mics();
+        let meeting = table.get(&self.final_event.meeting_id);
+        let mic = other_mic.and_then(|name| meeting.and_then(|m| m.get(name)));
+        let outputs: Vec<&MicHistory> = match meeting {
+            Some(m) if system_audio => m.values().filter(|d| d.is_output).collect(),
+            _ => Vec::new(),
+        };
+        let said = mic
+            .into_iter()
+            .chain(outputs.iter().copied())
+            .any(|device| {
+                text_covered(
+                    &self.final_event.transcript,
+                    &device.text_near(start_ms, end_ms),
+                )
+            });
+        let wait_mic = mic.is_some() && waited < MIC_HOLD;
+        let wait_system = waited < SYSTEM_AUDIO_HOLD
+            && outputs
+                .iter()
+                .any(|device| device.done_until_ms + lag < end_ms);
+        (said, wait_mic || wait_system)
     }
 }
 
@@ -1099,6 +1242,12 @@ struct LiveChunk {
     captured_at_unix_ms: u64,
     /// The cut is still growing: show its text, store nothing.
     preview: bool,
+}
+
+impl LiveChunk {
+    fn end_ms(&self) -> u64 {
+        self.captured_at_unix_ms + (self.samples.len() as u64 * 1000) / LIVE_SAMPLE_RATE as u64
+    }
 }
 
 fn normalize_frame(
@@ -1198,12 +1347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn voice_gate_passes_what_the_tracker_heard_as_a_voice_on_system_audio() {
-        let mic = VoiceGate::new(false).await;
-        if mic.vad.is_some() {
-            let quiet = vec![0.0f32; LIVE_SAMPLE_RATE as usize * 2];
-            assert!(!mic.passes(&quiet, VOICED_PASS_MS, 1, "Mic", "input").await);
-        }
+    async fn voice_gate_passes_what_the_tracker_heard_as_a_voice() {
         let gate = VoiceGate::new(true).await;
         if gate.vad.is_none() {
             return;
@@ -1216,6 +1360,201 @@ mod tests {
         );
         assert!(gate.passes(&quiet, VOICED_PASS_MS, 1, "Mic", "input").await);
         assert!(gate.hears_speech(&quiet, VOICED_PASS_MS).await);
+    }
+
+    /// A device of a meeting with `secs` of audio at one level from `start_ms`.
+    fn device(meeting_id: i64, name: &str, is_output: bool, start_ms: u64, gain: f32, secs: usize) {
+        let mut levels = MicLevels {
+            meeting_id,
+            device_name: name.into(),
+            is_output,
+            carry: Vec::new(),
+        };
+        levels.push(&vec![gain; LIVE_SAMPLE_RATE as usize * secs], start_ms);
+    }
+
+    #[test]
+    fn system_audio_is_quiet_sounding_unknown_or_absent() {
+        let start = 2_000_000;
+        device(9_101, "Mic", false, start, 0.1, 10);
+        assert_eq!(
+            system_audio(9_101, start, start + 8_000),
+            SystemAudio::Absent
+        );
+
+        device(9_102, "System Audio", true, start, 0.0, 10);
+        assert_eq!(
+            system_audio(9_102, start, start + 8_000),
+            SystemAudio::Quiet
+        );
+        // Nothing on record past the tenth second: not known to be quiet.
+        assert_eq!(
+            system_audio(9_102, start + 9_000, start + 17_000),
+            SystemAudio::Unknown
+        );
+
+        // Half a second of sound in eight seconds of silence still counts.
+        device(9_103, "System Audio", true, start, 0.0, 4);
+        device(9_103, "System Audio", true, start + 4_000, 0.2, 1);
+        device(9_103, "System Audio", true, start + 5_000, 0.0, 5);
+        assert_eq!(
+            system_audio(9_103, start, start + 8_000),
+            SystemAudio::Sounding
+        );
+        forget_mic(9_101, "Mic");
+        forget_mic(9_102, "System Audio");
+        forget_mic(9_103, "System Audio");
+    }
+
+    #[test]
+    fn a_microphone_uses_the_tracker_only_while_system_audio_is_quiet() {
+        let start = 3_000_000;
+        let chunk = LiveChunk {
+            samples: vec![0.1; LIVE_SAMPLE_RATE as usize * 4],
+            captured_at_unix_ms: start,
+            preview: false,
+        };
+        // No tracker in a unit test, so the count is 0 either way; what is
+        // checked is that the system audio's state is consulted without panic
+        // and that the states map to "use" and "do not use".
+        device(9_104, "System Audio", true, start, 0.2, 6);
+        assert_eq!(
+            system_audio(9_104, start, chunk.end_ms()),
+            SystemAudio::Sounding
+        );
+        assert_eq!(voiced_ms(None, &chunk, 9_104, "input"), 0);
+        forget_mic(9_104, "System Audio");
+    }
+
+    fn line(
+        meeting_id: i64,
+        device_name: &str,
+        start_ms: u64,
+        end_ms: u64,
+        text: &str,
+    ) -> LiveLine {
+        let delta = MeetingTranscriptDelta {
+            meeting_id,
+            provider: "test".into(),
+            model: None,
+            stream_id: "s".into(),
+            item_id: "i".into(),
+            device_name: device_name.into(),
+            device_type: "input".into(),
+            delta: text.into(),
+            replace: true,
+            captured_at: captured_at_from_ms(start_ms),
+        };
+        let final_event = MeetingTranscriptFinal {
+            meeting_id,
+            provider: "test".into(),
+            model: None,
+            stream_id: "s".into(),
+            item_id: "i".into(),
+            device_name: device_name.into(),
+            device_type: "input".into(),
+            session_speaker_id: None,
+            speaker_name: None,
+            speaker_id: None,
+            transcript: text.into(),
+            captured_at: captured_at_from_ms(start_ms),
+        };
+        LiveLine {
+            delta,
+            final_event,
+            speaker: None,
+            track: None,
+            span_ms: (start_ms, end_ms),
+        }
+    }
+
+    #[test]
+    fn a_microphone_line_waits_for_the_system_audio_and_no_longer() {
+        let (meeting, start) = (9_105, 4_000_000);
+        device(meeting, "Mic", false, start, 0.05, 10);
+        device(meeting, "System Audio", true, start, 0.2, 10);
+        let mine = line(
+            meeting,
+            "Mic",
+            start + 1_000,
+            start + 5_000,
+            "hidden between the curtain walls",
+        );
+        // Nothing from the system audio yet, and it has not dealt with the span.
+        assert_eq!(
+            mine.said_elsewhere(None, true, Duration::ZERO),
+            (false, true)
+        );
+        // Its cut came back with other words: nothing more to wait for.
+        note_mic_line(
+            meeting,
+            "System Audio",
+            MicLine {
+                start_ms: start,
+                end_ms: start + 6_000,
+                text: "something else entirely".into(),
+            },
+        );
+        mark_done(meeting, "System Audio", start + 6_000);
+        assert_eq!(
+            mine.said_elsewhere(None, true, Duration::ZERO),
+            (false, false)
+        );
+        // The same words there: the line is the loudspeakers.
+        note_mic_line(
+            meeting,
+            "System Audio",
+            MicLine {
+                start_ms: start,
+                end_ms: start + 6_000,
+                text: "Hidden between the curtain walls.".into(),
+            },
+        );
+        assert!(mine.said_elsewhere(None, true, Duration::ZERO).0);
+        // The ceiling, and a stream that is gone, both end the wait.
+        let late = line(
+            meeting,
+            "Mic",
+            start + 7_000,
+            start + 9_000,
+            "new words here",
+        );
+        assert_eq!(
+            late.said_elsewhere(None, true, Duration::ZERO),
+            (false, true)
+        );
+        assert_eq!(
+            late.said_elsewhere(None, true, SYSTEM_AUDIO_HOLD),
+            (false, false)
+        );
+        forget_mic(meeting, "System Audio");
+        assert_eq!(
+            late.said_elsewhere(None, true, Duration::ZERO),
+            (false, false)
+        );
+        forget_mic(meeting, "Mic");
+    }
+
+    #[test]
+    fn a_silent_cut_still_moves_the_done_mark() {
+        let (meeting, start) = (9_106, 5_000_000);
+        device(meeting, "System Audio", true, start, 0.0, 3);
+        let levels = MicLevels {
+            meeting_id: meeting,
+            device_name: "System Audio".into(),
+            is_output: true,
+            carry: Vec::new(),
+        };
+        let mut buffer = LiveChunkBuffer::default();
+        buffer.push(vec![0.0; LIVE_SAMPLE_RATE as usize * 2], start);
+        let mailbox = ChunkMailbox::default();
+        hand_off(&mut buffer, &mailbox, Some(&levels));
+        assert!(mailbox.take().is_none());
+        assert_eq!(
+            mics()[&meeting]["System Audio"].done_until_ms,
+            start + 2_000
+        );
+        forget_mic(meeting, "System Audio");
     }
 
     #[tokio::test]
@@ -1297,11 +1636,13 @@ mod tests {
         let mut headset = MicLevels {
             meeting_id,
             device_name: "Headset".into(),
+            is_output: false,
             carry: Vec::new(),
         };
         let mut laptop = MicLevels {
             meeting_id,
             device_name: "Laptop".into(),
+            is_output: false,
             carry: Vec::new(),
         };
         // The same sound, a quarter as loud on the laptop and 200 ms earlier there.
@@ -1343,6 +1684,7 @@ mod tests {
         let mut levels = MicLevels {
             meeting_id,
             device_name: "Mic".into(),
+            is_output: false,
             carry: Vec::new(),
         };
         levels.push(&[0.1; 500], 5_000);
