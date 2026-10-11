@@ -52,10 +52,16 @@ pub fn install_live_speaker_identifier(
     let _ = IDENTIFIER.set(Identifier { segmentation, db });
 }
 
-/// Speech segments shorter than this are not matched at all. Stricter than
-/// the batch path's 1 s: a wrong name on a live line is worse than none, and a
-/// 1.5 s segment was seen matching a named speaker it did not belong to.
-const MIN_LIVE_IDENTIFY_SECS: f64 = 2.0;
+/// The shortest single-voice stretch a live line is matched on. The sample is
+/// taken over the whole stretch (`voice_sample`), which is what makes one
+/// second usable: the diarizer's own sample covers at most two seconds from
+/// the start, and at two seconds most lines went unlabelled until the
+/// 30-second pass reached them.
+const MIN_LIVE_IDENTIFY_SECS: f64 = 1.0;
+
+/// Speakers with stored speech this recent are voices of the conversation in
+/// progress and are matched at the looser limit.
+const RECENT_SPEAKER_HOURS: f64 = 2.0;
 
 /// A segment this long counts as a voice of its own when deciding whether a
 /// cut holds more than one speaker.
@@ -135,9 +141,19 @@ pub(crate) async fn identify(
         return None;
     }
     let best = best.filter(|b| b.end - b.start >= MIN_LIVE_IDENTIFY_SECS)?;
+    let sample = voice_sample(&identifier.segmentation, &best).await;
+    let recent: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT speaker_id FROM audio_transcriptions
+         WHERE speaker_id IS NOT NULL AND julianday(timestamp) >= julianday('now') - ?1 / 24.0
+         LIMIT 64",
+    )
+    .bind(RECENT_SPEAKER_HOURS)
+    .fetch_all(&identifier.db.pool)
+    .await
+    .unwrap_or_default();
     match identifier
         .db
-        .match_speaker_from_embedding(&best.embedding)
+        .match_speaker_from_embedding_recent(&sample, &recent)
         .await
     {
         Ok(screenpipe_db::SpeakerEmbeddingMatch::Matched(speaker)) => Some(LiveSpeaker {
@@ -150,4 +166,28 @@ pub(crate) async fn identify(
             None
         }
     }
+}
+
+/// One sample over the whole of a segment's speech, falling back to the
+/// diarizer's own (its first two seconds) when the model cannot be run.
+async fn voice_sample(
+    segmentation: &crate::segmentation::segmentation_manager::SegmentationManager,
+    segment: &crate::speaker::segment::SpeechSegment,
+) -> Vec<f32> {
+    let Some(extractor) = segmentation.embedding_extractor.lock().await.clone() else {
+        return segment.embedding.clone();
+    };
+    if segment.sample_rate != 16000 || segment.samples.is_empty() {
+        return segment.embedding.clone();
+    }
+    let samples = segment.samples.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut extractor = extractor.lock().ok()?;
+        let sample: Vec<f32> = extractor.compute(&samples).ok()?.collect();
+        Some(sample).filter(|s| s.iter().any(|v| *v != 0.0) && s.iter().all(|v| v.is_finite()))
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| segment.embedding.clone())
 }
