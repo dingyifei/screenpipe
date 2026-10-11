@@ -458,10 +458,26 @@ pub(crate) async fn merge_speakers_handler(
     let speaker_to_keep_id = payload.speaker_to_keep_id;
     let speaker_to_merge_id = payload.speaker_to_merge_id;
 
-    state
+    let merged = state
         .db
         .merge_speakers_keeping_voice(speaker_to_keep_id, speaker_to_merge_id)
-        .await
+        .await;
+    if merged.is_ok() {
+        // A session in progress may be labelling a voice as the merged speaker.
+        let name = state
+            .db
+            .get_speaker_by_id(speaker_to_keep_id)
+            .await
+            .ok()
+            .map(|s| s.name)
+            .filter(|name| !name.trim().is_empty());
+        screenpipe_audio::meeting_streaming::speaker_merged(
+            speaker_to_merge_id,
+            speaker_to_keep_id,
+            name,
+        );
+    }
+    merged
         .map(|(samples_moved, samples_dropped)| {
             JsonResponse(json!({
                 "success": true,
