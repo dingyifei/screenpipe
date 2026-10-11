@@ -546,7 +546,14 @@ async fn transcribe_speaker_segments(
             HeadSegment::Keep => {}
             HeadSegment::Skip => continue,
             HeadSegment::TrimStart(secs) => {
-                let cut = ((secs * segment.sample_rate as f64) as usize).min(segment.samples.len());
+                // Keep the tail of the right length rather than cutting `secs`
+                // off the front: a segment is several stretches of speech with
+                // the gaps between them removed, so its samples are shorter
+                // than its span and a cut by time from the front takes too
+                // much. Too little cut repeats a word; too much loses one.
+                let keep = ((segment.end - segment.start - secs).max(0.0)
+                    * segment.sample_rate as f64) as usize;
+                let cut = segment.samples.len().saturating_sub(keep);
                 segment.samples.drain(..cut);
                 segment.start += secs;
             }
@@ -972,11 +979,25 @@ pub async fn retranscribe_handler(
         use screenpipe_audio::core::engine::AudioTranscriptionEngine;
         match engine_str.parse::<AudioTranscriptionEngine>() {
             Ok(e) => Arc::new(e),
-            Err(_) => audio_manager.transcription_engine().await,
+            // Not a fallback to the configured engine: that one may be
+            // `disabled`, which answers every segment with nothing, and
+            // "nothing" replaces the rows a chunk already has.
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown engine: {}", engine_str),
+                )
+            }
         }
     } else {
         audio_manager.transcription_engine().await
     };
+    if *engine == screenpipe_audio::core::engine::AudioTranscriptionEngine::Disabled {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "the transcription engine is disabled; name one in `engine`".into(),
+        );
+    }
 
     let deepgram_config = audio_manager.deepgram_config().await;
     let openai_compatible_config = audio_manager.openai_compatible_config().await;
@@ -1087,7 +1108,11 @@ pub async fn retranscribe_handler(
             match screenpipe_audio::utils::ffmpeg::read_audio_from_file(file_path) {
                 Ok(result) => result,
                 Err(e) => {
+                    // The file is there and unreadable; a missing file (above)
+                    // is not a failure, or one deleted recording would hold
+                    // the nightly run's place for good.
                     error!("failed to decode audio for chunk {}: {}", chunk.id, e);
+                    failed.push(chunk.id);
                     continue;
                 }
             };
