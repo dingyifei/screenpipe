@@ -68,6 +68,12 @@ pub struct MeetingStreamingConfig {
     /// never sends meeting audio to any endpoint.
     #[serde(default)]
     pub openai_compatible_fallback: bool,
+    /// Selected-engine provider: transcribe a sentence again and again while
+    /// it is being spoken, so its line shows before the speaker pauses. Costs
+    /// several model calls per sentence instead of one. Off unless whoever
+    /// starts the meeting asks for it.
+    #[serde(default)]
+    pub live_previews: bool,
 }
 
 impl Default for MeetingStreamingConfig {
@@ -116,6 +122,7 @@ impl Default for MeetingStreamingConfig {
             persist_finals: true,
             keyterms: Vec::new(),
             openai_compatible_fallback: false,
+            live_previews: false,
         }
     }
 }
@@ -216,6 +223,7 @@ impl MeetingStreamingConfig {
             language: language.filter(|s| !s.trim().is_empty()),
             local_speaker_name: local_speaker_name.and_then(|name| non_empty_trimmed(&name)),
             openai_compatible_fallback: is_openai_compatible_provider(provider_setting),
+            live_previews: false,
             ..Self::default()
         };
 

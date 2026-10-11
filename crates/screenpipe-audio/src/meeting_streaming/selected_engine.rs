@@ -289,7 +289,7 @@ async fn run_stream(
         device_name: device_name.clone(),
         carry: Vec::new(),
     });
-    let ingest = ingest_loop(rx, Arc::clone(&mailbox), mic_levels);
+    let ingest = ingest_loop(rx, Arc::clone(&mailbox), mic_levels, config.live_previews);
     tokio::pin!(ingest);
 
     let outcome = tokio::select! {
@@ -367,6 +367,7 @@ async fn ingest_loop(
     mut rx: mpsc::Receiver<MeetingAudioFrame>,
     mailbox: Arc<ChunkMailbox>,
     mut mic_levels: Option<MicLevels>,
+    live_previews: bool,
 ) -> Result<()> {
     let mut buffer = LiveChunkBuffer::default();
     let mut resampler: Option<StreamResampler> = None;
@@ -408,7 +409,7 @@ async fn ingest_loop(
                 if buffer.duration() >= LIVE_CHUNK_MIN && ends_in_pause(&buffer.samples) {
                     hand_off(&mut buffer, &mailbox);
                     previewed = 0;
-                } else if preview_due(buffer.samples.len(), previewed) {
+                } else if live_previews && preview_due(buffer.samples.len(), previewed) {
                     if let Some(preview) = buffer.preview() {
                         let covered = preview.samples.len();
                         if mailbox.put_preview(preview) {

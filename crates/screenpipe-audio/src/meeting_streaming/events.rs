@@ -119,6 +119,10 @@ pub struct MeetingLifecycleEvent {
     /// language code, or "auto" for no hint. Absent means the configured one.
     #[serde(default)]
     pub language: Option<String>,
+    /// Show each sentence while it is still being spoken (see
+    /// `MeetingStreamingConfig::live_previews`).
+    #[serde(default)]
+    pub live_previews: bool,
 }
 
 impl MeetingLifecycleEvent {
