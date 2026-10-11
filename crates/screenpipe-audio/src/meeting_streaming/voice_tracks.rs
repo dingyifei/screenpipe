@@ -266,6 +266,24 @@ impl Timeline {
         })
     }
 
+    /// How much of a span some voice was heard in, in milliseconds.
+    fn voiced_ms(&self, start_ms: u64, end_ms: u64) -> u64 {
+        let (Some(start), Some(end)) = (self.sample_at(start_ms), self.sample_at(end_ms)) else {
+            return 0;
+        };
+        let samples: u64 = self
+            .stretches
+            .iter()
+            .map(|stretch| {
+                stretch
+                    .end
+                    .min(end)
+                    .saturating_sub(stretch.start.max(start))
+            })
+            .sum();
+        samples * 1000 / SAMPLE_RATE
+    }
+
     fn change_after(&self, from_ms: u64) -> Option<u64> {
         let from = self.sample_at(from_ms + MIN_CUT_BEFORE_CHANGE_MS)?;
         let cut_start = self.sample_at(from_ms)?;
@@ -564,6 +582,15 @@ impl VoiceTracker {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .label(start_ms, end_ms)
+    }
+
+    /// How much of a span some voice was heard in, in milliseconds. Singing
+    /// counts here, which the speech detector of the live gate does not hear.
+    pub(crate) fn voiced_ms(&self, start_ms: u64, end_ms: u64) -> u64 {
+        self.timeline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .voiced_ms(start_ms, end_ms)
     }
 
     /// When the track first changes inside a cut that began at `from_ms`.
@@ -881,6 +908,16 @@ mod tests {
         assert_eq!(timeline.stretches.len(), 2);
         assert_eq!(timeline.stretches[0].end, 300 * FRAME_SAMPLES);
         assert_eq!(timeline.stretches[1].start, 300 * FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn voiced_ms_counts_the_voice_inside_a_span() {
+        let mut timeline = timed();
+        feed(&mut timeline, 0, 100, Some(0)); // one second of voice
+        feed(&mut timeline, 100, 100, None); // one second of nothing
+        assert_eq!(timeline.voiced_ms(1_000_000, 1_002_000), 1_000);
+        assert_eq!(timeline.voiced_ms(1_000_500, 1_002_000), 500);
+        assert_eq!(timeline.voiced_ms(1_001_000, 1_002_000), 0);
     }
 
     #[test]

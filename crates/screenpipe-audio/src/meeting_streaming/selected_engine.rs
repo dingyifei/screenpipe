@@ -43,6 +43,8 @@ const PAUSE_TAIL: Duration = Duration::from_millis(400);
 /// Tail energy, relative to the whole buffer, below which the speaker has paused.
 const PAUSE_RELATIVE_RMS: f32 = 0.35;
 const MIN_LIVE_RMS: f32 = 0.003;
+/// This much voice in a chunk by the voice tracker's count passes the speech gate by itself.
+const VOICED_PASS_MS: u64 = 1_000;
 /// While a sentence is still being spoken, what there is of it so far is
 /// transcribed again each time it has grown by this much, and shown in place
 /// of the last attempt. The speech model takes whole clips only, so this is
@@ -493,6 +495,15 @@ fn hand_off(buffer: &mut LiveChunkBuffer, mailbox: &ChunkMailbox) {
     mailbox.put(chunk);
 }
 
+/// How long the voice tracker heard somebody in a chunk; 0 when the device is not followed.
+fn voiced_ms(tracker: Option<&VoiceTracker>, chunk: &LiveChunk) -> u64 {
+    let end_ms =
+        chunk.captured_at_unix_ms + (chunk.samples.len() as u64 * 1000) / LIVE_SAMPLE_RATE as u64;
+    tracker.map_or(0, |tracker| {
+        tracker.voiced_ms(chunk.captured_at_unix_ms, end_ms)
+    })
+}
+
 /// Speech gate for live chunks: the same VAD criterion the batch path applies
 /// to a whole 30 s chunk, applied to each short cut. The RMS check in
 /// `hand_off` only removes digital silence; room noise passes it, and an STT
@@ -536,18 +547,26 @@ impl VoiceGate {
     }
 
     /// `true` when a preview is worth transcribing. Not announced: the finished cut will be.
-    async fn hears_speech(&self, samples_16k: &[f32]) -> bool {
+    async fn hears_speech(&self, samples_16k: &[f32], voiced_ms: u64) -> bool {
         match self.speech_ratio(samples_16k).await {
-            Some(ratio) => ratio > crate::vad::asked_for_min_speech_ratio(),
+            Some(ratio) => {
+                ratio > crate::vad::asked_for_min_speech_ratio() || voiced_ms >= VOICED_PASS_MS
+            }
             None => true,
         }
     }
 
     /// `true` when the chunk should be transcribed, announcing the verdict.
     /// Without a detector nothing is gated and nothing is announced.
+    ///
+    /// `voiced_ms` is how long the voice tracker heard somebody in the chunk.
+    /// The detector is trained on talk and scores singing as nothing; the
+    /// tracker follows voices and hears it, so a second of voice by its count
+    /// passes a chunk the detector would hold.
     async fn passes(
         &self,
         samples_16k: &[f32],
+        voiced_ms: u64,
         meeting_id: i64,
         device_name: &str,
         device_type: &str,
@@ -556,7 +575,7 @@ impl VoiceGate {
             return true;
         };
         let min_speech_ratio = crate::vad::asked_for_min_speech_ratio();
-        let passed = speech_ratio > min_speech_ratio;
+        let passed = speech_ratio > min_speech_ratio || voiced_ms >= VOICED_PASS_MS;
         let _ = screenpipe_events::send_event(
             "meeting_streaming_voice_gate",
             MeetingStreamingVoiceGate {
@@ -597,6 +616,7 @@ async fn transcribe_loop(
                 show_preview(
                     chunk,
                     &voice_gate,
+                    tracker.as_deref(),
                     &mut session,
                     &config,
                     meeting_id,
@@ -608,7 +628,13 @@ async fn transcribe_loop(
                 .await;
                 Ok(())
             } else if !voice_gate
-                .passes(&chunk.samples, meeting_id, &device_name, &device_type)
+                .passes(
+                    &chunk.samples,
+                    voiced_ms(tracker.as_deref(), &chunk),
+                    meeting_id,
+                    &device_name,
+                    &device_type,
+                )
                 .await
             {
                 debug!("meeting streaming: selected-engine live chunk had no speech; skipping");
@@ -639,7 +665,13 @@ async fn transcribe_loop(
     while let Some(chunk) = mailbox.take() {
         if chunk.preview
             || !voice_gate
-                .passes(&chunk.samples, meeting_id, &device_name, &device_type)
+                .passes(
+                    &chunk.samples,
+                    voiced_ms(tracker.as_deref(), &chunk),
+                    meeting_id,
+                    &device_name,
+                    &device_type,
+                )
                 .await
         {
             continue;
@@ -679,6 +711,7 @@ fn live_item_id(stream_id: &str, device_type: &str, captured_at_unix_ms: u64) ->
 async fn show_preview(
     chunk: LiveChunk,
     voice_gate: &VoiceGate,
+    tracker: Option<&VoiceTracker>,
     session: &mut TranscriptionSession,
     config: &MeetingStreamingConfig,
     meeting_id: i64,
@@ -687,7 +720,10 @@ async fn show_preview(
     device_type: &str,
     model: Option<String>,
 ) {
-    if !voice_gate.hears_speech(&chunk.samples).await {
+    if !voice_gate
+        .hears_speech(&chunk.samples, voiced_ms(tracker, &chunk))
+        .await
+    {
         return;
     }
     let end_ms =
@@ -1148,8 +1184,24 @@ mod tests {
             .map(|i| if (i * 7919) % 13 < 6 { 0.006 } else { -0.006 })
             .collect();
         assert!(rms(&noise) >= MIN_LIVE_RMS);
-        assert!(!gate.passes(&noise, 1, "Mic", "input").await);
-        assert!(!gate.passes(&[], 1, "Mic", "input").await);
+        assert!(!gate.passes(&noise, 0, 1, "Mic", "input").await);
+        assert!(!gate.passes(&[], 0, 1, "Mic", "input").await);
+    }
+
+    #[tokio::test]
+    async fn voice_gate_passes_what_the_tracker_heard_as_a_voice() {
+        let gate = VoiceGate::new(false).await;
+        if gate.vad.is_none() {
+            return;
+        }
+        let quiet = vec![0.0f32; LIVE_SAMPLE_RATE as usize * 2];
+        assert!(
+            !gate
+                .passes(&quiet, VOICED_PASS_MS - 1, 1, "Mic", "input")
+                .await
+        );
+        assert!(gate.passes(&quiet, VOICED_PASS_MS, 1, "Mic", "input").await);
+        assert!(gate.hears_speech(&quiet, VOICED_PASS_MS).await);
     }
 
     #[tokio::test]
@@ -1158,7 +1210,7 @@ mod tests {
             vad: None,
             is_output_device: false,
         };
-        assert!(gate.passes(&[0.0; 1600], 1, "Mic", "input").await);
+        assert!(gate.passes(&[0.0; 1600], 0, 1, "Mic", "input").await);
     }
 
     #[test]
