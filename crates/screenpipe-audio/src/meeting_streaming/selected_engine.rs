@@ -283,6 +283,14 @@ impl MicLevels {
     }
 }
 
+/// A live stream has started for one device of a meeting.
+#[derive(Clone, Debug, Serialize)]
+struct MeetingStreamingDeviceStarted {
+    meeting_id: i64,
+    device_name: String,
+    device_type: String,
+}
+
 /// The speech gate's verdict on one live cut, for anything showing what it lets through.
 #[derive(Clone, Debug, Serialize)]
 struct MeetingStreamingVoiceGate {
@@ -343,6 +351,20 @@ async fn run_stream(
     // vocabulary + calendar attendee names) by seeding the session vocabulary.
     let session = selected_engine_session(&engine_ref, &config).await?;
     let model = selected_engine_model(&session);
+
+    // Which device this stream is. A session's system audio can change under
+    // it: with meeting piggyback on, the recorder swaps the global tap for a
+    // per-process "Meeting Tap" on the meeting app once that app uses audio,
+    // and every other app's sound then reaches the session only through the
+    // microphone. Announced so whoever shows the session can say so.
+    let _ = screenpipe_events::send_event(
+        "meeting_streaming_device_started",
+        MeetingStreamingDeviceStarted {
+            meeting_id,
+            device_name: device_name.clone(),
+            device_type: device_type.clone(),
+        },
+    );
 
     // Transcription runs on its own task. The ingest loop only receives and
     // buffers audio, so a slow transcribe() can never stall it, and the
