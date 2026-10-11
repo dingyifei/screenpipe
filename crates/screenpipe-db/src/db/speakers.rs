@@ -888,6 +888,67 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Add `embeddings` to a speaker's stored voice without touching what is
+    /// there: a second language, another microphone. Takes as many as fit under
+    /// [`SPEAKER_MAX_STORED_EMBEDDINGS`] and returns how many that was. The
+    /// centre becomes the mean of everything stored.
+    pub async fn add_speaker_embeddings(
+        &self,
+        speaker_id: i64,
+        embeddings: &[Vec<f32>],
+    ) -> Result<usize, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let stored: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?1")
+                .bind(speaker_id)
+                .fetch_one(&mut **tx.conn())
+                .await?;
+        let room = SPEAKER_MAX_STORED_EMBEDDINGS.saturating_sub(stored as usize);
+        let embeddings = &embeddings[..embeddings.len().min(room)];
+        for embedding in embeddings {
+            let bytes: &[u8] = embedding.as_bytes();
+            sqlx::query(
+                "INSERT INTO speaker_embeddings (embedding, speaker_id) VALUES (vec_f32(?1), ?2)",
+            )
+            .bind(bytes)
+            .bind(speaker_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        }
+        let all: Vec<Vec<u8>> =
+            sqlx::query_scalar("SELECT embedding FROM speaker_embeddings WHERE speaker_id = ?1")
+                .bind(speaker_id)
+                .fetch_all(&mut **tx.conn())
+                .await?;
+        let samples: Vec<Vec<f32>> = all
+            .iter()
+            .map(|blob| {
+                blob.chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect()
+            })
+            .collect();
+        if let Some(first) = samples.first() {
+            let mut centroid = vec![0f32; first.len()];
+            for sample in samples.iter().filter(|s| s.len() == first.len()) {
+                for (sum, value) in centroid.iter_mut().zip(sample) {
+                    *sum += value / samples.len() as f32;
+                }
+            }
+            let bytes: &[u8] = centroid.as_bytes();
+            sqlx::query(
+                "UPDATE speakers SET centroid = vec_f32(?1), embedding_count = ?2 WHERE id = ?3",
+            )
+            .bind(bytes)
+            .bind(samples.len() as i64)
+            .bind(speaker_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(embeddings.len())
+    }
+
     pub async fn search_speakers(&self, name_prefix: &str) -> Result<Vec<Speaker>, sqlx::Error> {
         self.search_speakers_limited(name_prefix, 100, 0, true)
             .await

@@ -502,9 +502,11 @@ async fn assign_speakers(
     voices: &[Vec<f32>],
     mut recent: Option<&mut Vec<i64>>,
     chunk_id: i64,
+    device_name: &str,
+    tracks: &[Option<String>],
 ) {
     use screenpipe_audio::speaker::voice_groups::{
-        follow_neighbours, group_voices, VoicePiece, GROUP_VOICE_SECS,
+        follow_neighbours, group_voices_by_track, VoicePiece, GROUP_VOICE_SECS,
     };
     let pieces: Vec<VoicePiece<'_>> = results
         .iter()
@@ -515,7 +517,7 @@ async fn assign_speakers(
             embedding: voice,
         })
         .collect();
-    let (groups, of) = group_voices(&pieces);
+    let (groups, of, group_track) = group_voices_by_track(&pieces, tracks);
     drop(pieces);
     let mut group_speaker: Vec<Option<i64>> = Vec::with_capacity(groups.len());
     for group in &groups {
@@ -548,6 +550,19 @@ async fn assign_speakers(
         }
         group_speaker.push(speaker);
     }
+    // A track that now has a stored speaker says so on the lines still to come.
+    for (track, speaker) in group_track.iter().zip(&group_speaker) {
+        if let (Some(track), Some(id)) = (track, speaker) {
+            let name = state
+                .db
+                .get_speaker_by_id(*id)
+                .await
+                .ok()
+                .map(|s| s.name)
+                .filter(|name| !name.trim().is_empty());
+            screenpipe_audio::meeting_streaming::name_track(device_name, track, *id, name);
+        }
+    }
     let mut speakers: Vec<Option<i64>> = of
         .iter()
         .map(|group| group.and_then(|group| group_speaker[group]))
@@ -557,6 +572,38 @@ async fn assign_speakers(
     for (result, speaker) in results.iter_mut().zip(speakers) {
         result.speaker_id = speaker;
     }
+}
+
+/// The live track that spoke most of each piece, when this file was recorded
+/// in a session whose device was followed (`meeting_streaming::voice_tracks`).
+/// All `None` otherwise, as for every file the nightly job handles.
+fn tracks_of(
+    device_name: &str,
+    chunk: &AudioChunkInfo,
+    results: &[RetranscribeSegmentResult],
+) -> Vec<Option<String>> {
+    let file_start_ms = chunk.timestamp.timestamp_millis().max(0) as u64;
+    results
+        .iter()
+        .map(|piece| {
+            let start = file_start_ms + (piece.start * 1000.0) as u64;
+            let end = file_start_ms + (piece.end * 1000.0) as u64;
+            let mut heard: std::collections::HashMap<String, u64> = Default::default();
+            for span in screenpipe_audio::meeting_streaming::track_spans(device_name, start, end) {
+                let overlap = span
+                    .end_ms
+                    .min(end)
+                    .saturating_sub(span.start_ms.max(start));
+                *heard.entry(span.track).or_default() += overlap;
+            }
+            // Half the piece at least: the file's start is known to the second.
+            heard
+                .into_iter()
+                .max_by_key(|(_, ms)| *ms)
+                .filter(|(_, ms)| *ms * 2 >= end.saturating_sub(start))
+                .map(|(track, _)| track)
+        })
+        .collect()
 }
 
 /// Transcribe one chunk segment by segment, with a speaker per segment.
@@ -770,12 +817,15 @@ async fn transcribe_speaker_segments(
             text,
         });
     }
+    let tracks = tracks_of(device_name, chunk, &results);
     assign_speakers(
         state,
         &mut results,
         &voices,
         recent.as_deref_mut(),
         chunk_id,
+        device_name,
+        &tracks,
     )
     .await;
     Some(results)

@@ -192,3 +192,45 @@ async fn voice_sample(
     .flatten()
     .unwrap_or_else(|| segment.embedding.clone())
 }
+
+/// The voice-sample model, for code that runs off the async runtime.
+pub(crate) fn live_embedding_extractor(
+) -> Option<Arc<std::sync::Mutex<crate::speaker::embedding::EmbeddingExtractor>>> {
+    IDENTIFIER
+        .get()?
+        .segmentation
+        .embedding_extractor
+        .blocking_lock()
+        .clone()
+}
+
+/// The stored speaker a track's pooled voice belongs to. Match-only, like
+/// [`identify`]. Named speakers are matched at the looser limit along with the
+/// ones heard lately: a track is several seconds of one voice, and against a
+/// clean stored sample that measured 0.45 at most for the same person in
+/// either language and 0.9 for anyone else.
+pub(crate) async fn stored_speaker_for(voice: &[f32]) -> Option<LiveSpeaker> {
+    let identifier = IDENTIFIER.get()?;
+    let known: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM speakers WHERE COALESCE(name, '') != ''
+         UNION
+         SELECT DISTINCT speaker_id FROM audio_transcriptions
+         WHERE speaker_id IS NOT NULL AND julianday(timestamp) >= julianday('now') - ?1 / 24.0
+         LIMIT 256",
+    )
+    .bind(RECENT_SPEAKER_HOURS)
+    .fetch_all(&identifier.db.pool)
+    .await
+    .unwrap_or_default();
+    match identifier
+        .db
+        .match_speaker_from_embedding_recent(voice, &known)
+        .await
+    {
+        Ok(screenpipe_db::SpeakerEmbeddingMatch::Matched(speaker)) => Some(LiveSpeaker {
+            id: speaker.id,
+            name: Some(speaker.name).filter(|name| !name.trim().is_empty()),
+        }),
+        _ => None,
+    }
+}
