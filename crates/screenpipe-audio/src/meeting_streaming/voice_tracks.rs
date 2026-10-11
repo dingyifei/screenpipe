@@ -949,4 +949,59 @@ mod tests {
         assert_eq!((spans[0].start_ms, spans[0].end_ms), (1_000_000, 1_002_000));
         assert_eq!(spans[1].track, "mic#2");
     }
+
+    /// A tracker with no helper behind it: `slots` blocks of audio may wait.
+    fn tracker(
+        device: &str,
+        slots: usize,
+    ) -> (Arc<VoiceTracker>, std::sync::mpsc::Receiver<Vec<f32>>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(slots);
+        let tracker = Arc::new(VoiceTracker {
+            meeting_id: 1,
+            device_name: device.to_string(),
+            device_type: "input".to_string(),
+            timeline: Arc::new(Mutex::new(Timeline::default())),
+            audio_tx: Mutex::new(Some(tx)),
+            child: Arc::new(Mutex::new(None)),
+        });
+        (tracker, rx)
+    }
+
+    #[test]
+    fn a_helper_that_stops_reading_ends_tracking_instead_of_queueing() {
+        let (tracker, _unread) = tracker("stuck mic", 1);
+        tracker.push(&[0.0; 160], 1_000);
+        assert!(tracker.audio_tx.lock().unwrap().is_some());
+        // The one slot is taken and nobody reads: the next block has nowhere to go.
+        tracker.push(&[0.0; 160], 1_010);
+        assert!(tracker.audio_tx.lock().unwrap().is_none());
+        // Later audio is still kept for the timeline, and nothing blocks.
+        tracker.push(&[0.0; 160], 1_020);
+        assert_eq!(tracker.timeline.lock().unwrap().pushed, 480);
+    }
+
+    #[test]
+    fn a_merge_renames_the_tracks_recognised_as_the_merged_speaker() {
+        let (tracker, _rx) = tracker("merge mic", 4);
+        {
+            let mut timeline = tracker.timeline.lock().unwrap();
+            for speaker in [Some((7, None)), Some((8, Some("Ann".to_string()))), None] {
+                let index = timeline.new_track("merge mic");
+                timeline.tracks[index].speaker = speaker;
+            }
+        }
+        trackers().insert("merge mic".to_string(), Arc::clone(&tracker));
+        speaker_merged(7, 9, Some("Me".to_string()));
+        trackers().remove("merge mic");
+        let timeline = tracker.timeline.lock().unwrap();
+        assert_eq!(
+            timeline.tracks[0].speaker,
+            Some((9, Some("Me".to_string())))
+        );
+        assert_eq!(
+            timeline.tracks[1].speaker,
+            Some((8, Some("Ann".to_string())))
+        );
+        assert_eq!(timeline.tracks[2].speaker, None);
+    }
 }

@@ -168,7 +168,16 @@ pub fn group_voices_by_track(
 /// Only pieces that had a speaker coming in are followed, so a label does not
 /// travel down a chain of scraps. A short piece is far more often the same
 /// person carrying on than anything its own sample can show.
-pub fn follow_neighbours(spans: &[(f64, f64)], speakers: &mut [Option<i64>]) {
+///
+/// `may_follow(piece, neighbour)` is the caller's veto: a neighbour heard as a
+/// different voice, or a piece that was left unnamed on purpose, is not a
+/// case of someone carrying on. A refused neighbour is passed over, so the
+/// piece may still follow the one on its other side.
+pub fn follow_neighbours(
+    spans: &[(f64, f64)],
+    speakers: &mut [Option<i64>],
+    may_follow: impl Fn(usize, usize) -> bool,
+) {
     let known: Vec<Option<i64>> = speakers.to_vec();
     for i in 0..spans.len() {
         if known[i].is_some() {
@@ -176,11 +185,11 @@ pub fn follow_neighbours(spans: &[(f64, f64)], speakers: &mut [Option<i64>]) {
         }
         let (start, end) = spans[i];
         let before = (0..spans.len())
-            .filter(|&j| known[j].is_some() && spans[j].1 <= start + 1e-6)
+            .filter(|&j| known[j].is_some() && spans[j].1 <= start + 1e-6 && may_follow(i, j))
             .max_by(|&a, &b| spans[a].1.total_cmp(&spans[b].1))
             .filter(|&j| start - spans[j].1 <= NEIGHBOUR_GAP_SECS);
         let after = (0..spans.len())
-            .filter(|&j| known[j].is_some() && spans[j].0 + 1e-6 >= end)
+            .filter(|&j| known[j].is_some() && spans[j].0 + 1e-6 >= end && may_follow(i, j))
             .min_by(|&a, &b| spans[a].0.total_cmp(&spans[b].0))
             .filter(|&j| spans[j].0 - end <= NEIGHBOUR_GAP_SECS);
         speakers[i] = before.or(after).and_then(|j| known[j]);
@@ -276,7 +285,7 @@ mod tests {
             (30.0, 31.0),
         ];
         let mut speakers = [Some(1), None, None, Some(2), None];
-        follow_neighbours(&spans, &mut speakers);
+        follow_neighbours(&spans, &mut speakers, |_, _| true);
         // After 1's piece; just before 2's; and too far from anybody.
         assert_eq!(speakers, [Some(1), Some(1), Some(2), Some(2), None]);
     }
@@ -285,7 +294,7 @@ mod tests {
     fn a_followed_label_does_not_travel_down_a_chain() {
         let spans = [(0.0, 4.0), (5.0, 6.0), (7.0, 8.0)];
         let mut speakers = [Some(1), None, None];
-        follow_neighbours(&spans, &mut speakers);
+        follow_neighbours(&spans, &mut speakers, |_, _| true);
         assert_eq!(speakers, [Some(1), Some(1), None]);
     }
 
@@ -330,5 +339,22 @@ mod tests {
         assert!((groups[0].secs - 7.0).abs() < 1e-6);
         // The other voice left no trace in the track's sample.
         assert!(cosine_distance(&groups[0].embedding, &a) < 0.05);
+    }
+
+    #[test]
+    fn a_piece_does_not_follow_a_neighbour_it_is_told_not_to() {
+        let spans = [(0.0, 3.0), (3.2, 3.8), (4.0, 7.0)];
+        // Free to follow: takes the one before.
+        let mut speakers = [Some(1), None, Some(2)];
+        follow_neighbours(&spans, &mut speakers, |_, _| true);
+        assert_eq!(speakers[1], Some(1));
+        // The one before is refused (another voice): the one after is used.
+        let mut speakers = [Some(1), None, Some(2)];
+        follow_neighbours(&spans, &mut speakers, |_, neighbour| neighbour != 0);
+        assert_eq!(speakers[1], Some(2));
+        // Left unnamed on purpose: stays that way.
+        let mut speakers = [Some(1), None, Some(2)];
+        follow_neighbours(&spans, &mut speakers, |piece, _| piece != 1);
+        assert_eq!(speakers[1], None);
     }
 }

@@ -287,7 +287,10 @@ impl DatabaseManager {
         // speaker's ten stored embeddings can occupy both result slots and hide
         // a genuinely close runner-up profile.
         // A few more than two: a candidate inside the general limit can sit
-        // behind recent ones that are only inside the looser limit.
+        // behind recent ones that are only inside the looser limit. Each
+        // speaker's own limit is applied in the query, before the cut to six:
+        // applied afterwards, six voices just past the general limit hid a
+        // recent one that was inside the looser limit.
         let candidates: Vec<SpeakerMatchCandidate> = sqlx::query_as(AssertSqlSafe(format!(
             "WITH candidates AS (
                  SELECT s.id, COALESCE(s.name, '') AS name, COALESCE(s.metadata, '') AS metadata,
@@ -301,11 +304,14 @@ impl DatabaseManager {
              )
              SELECT id, name, metadata, distance
              FROM candidates
+             WHERE distance < CASE WHEN id IN ({recent_list}) THEN ?3 ELSE ?4 END
              ORDER BY distance, id
              LIMIT 6"
         )))
         .bind(bytes)
         .bind(day)
+        .bind(SPEAKER_MATCH_RECENT_MAX_DISTANCE)
+        .bind(SPEAKER_MATCH_MAX_DISTANCE)
         .fetch_all(&self.pool)
         .await?;
 
