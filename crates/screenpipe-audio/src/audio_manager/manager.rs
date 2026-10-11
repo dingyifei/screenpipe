@@ -2277,6 +2277,28 @@ impl AudioManager {
         device: &str,
         is_output_device: bool,
     ) -> Result<Vec<crate::speaker::segment::SpeechSegment>> {
+        self.speech_segments_above(
+            samples_16k,
+            vad,
+            device,
+            is_output_device,
+            crate::vad::asked_for_min_speech_ratio(),
+        )
+        .await
+    }
+
+    /// [`Self::speech_segments`] with the speech threshold of the whole chunk
+    /// given by the caller. A negative one lets every chunk through to the
+    /// segmenter: for a chunk known by other means to hold a voice the
+    /// detector does not count, such as singing.
+    pub async fn speech_segments_above(
+        &self,
+        samples_16k: &[f32],
+        vad: Arc<Mutex<Box<dyn VadEngine + Send>>>,
+        device: &str,
+        is_output_device: bool,
+        min_speech_ratio: f32,
+    ) -> Result<Vec<crate::speaker::segment::SpeechSegment>> {
         let segmentation_manager = self.segmentation_manager.clone();
         let segmentation_model_path = segmentation_manager
             .segmentation_model_path
@@ -2297,7 +2319,7 @@ impl AudioManager {
             device,
             is_output_device,
             false,
-            crate::vad::asked_for_min_speech_ratio(),
+            min_speech_ratio,
         )
         .await?;
         if !speech_ratio_ok {
