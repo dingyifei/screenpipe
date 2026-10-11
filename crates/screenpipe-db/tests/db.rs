@@ -2122,6 +2122,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_teaching_is_kept_beside_the_first() {
+        let db = setup_test_db().await;
+        let me = db.insert_speaker(&voice_at(0.0)).await.unwrap();
+        db.update_speaker_name(me.id, "Me").await.unwrap();
+        db.replace_speaker_embeddings(me.id, &[voice_at(0.0), voice_at(10.0)])
+            .await
+            .unwrap();
+        // The same person in another language: a different-sounding sample.
+        let added = db
+            .add_speaker_embeddings(me.id, &[voice_at(70.0), voice_at(80.0)])
+            .await
+            .unwrap();
+        assert_eq!(added, 2);
+        assert_eq!(sample_count(&db, me.id).await, 4);
+        for angle in [5.0, 75.0] {
+            assert!(matches!(
+                db.match_speaker_from_embedding(&voice_at(angle))
+                    .await
+                    .unwrap(),
+                screenpipe_db::SpeakerEmbeddingMatch::Matched(_)
+            ));
+        }
+        // Full is full: nothing is pushed out to make room.
+        let many: Vec<Vec<f32>> = (0..20).map(|i| voice_at(i as f32)).collect();
+        let added = db.add_speaker_embeddings(me.id, &many).await.unwrap();
+        assert_eq!(sample_count(&db, me.id).await, 4 + added as i64);
+        assert_eq!(db.add_speaker_embeddings(me.id, &many).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn test_search_speakers() {
         let db = setup_test_db().await;
 

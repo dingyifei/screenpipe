@@ -71,15 +71,37 @@ fn nearest(groups: &[VoiceGroup], embedding: &[f32]) -> Option<(usize, f32)> {
 /// [`SAME_VOICE_MAX_DISTANCE`] or founds one. What a group may do depends on
 /// its `secs`, which is the caller's call (see [`GROUP_VOICE_SECS`]).
 pub fn group_voices(pieces: &[VoicePiece<'_>]) -> (Vec<VoiceGroup>, Vec<Option<usize>>) {
+    let (groups, of, _) = group_voices_by_track(pieces, &vec![None; pieces.len()]);
+    (groups, of)
+}
+
+/// [`group_voices`] for a file whose pieces were followed live: a piece with a
+/// track (`tracks[i]`) belongs to that track's group whatever its own sample
+/// says and however short it is, because the track was heard as one voice over
+/// far more than this piece. Pieces without a track are grouped by voice as
+/// before, and may join a track's group. Also returns each group's track.
+pub fn group_voices_by_track(
+    pieces: &[VoicePiece<'_>],
+    tracks: &[Option<String>],
+) -> (Vec<VoiceGroup>, Vec<Option<usize>>, Vec<Option<String>>) {
     let secs = |p: &VoicePiece<'_>| (p.end - p.start).max(0.0);
     let mut groups: Vec<VoiceGroup> = Vec::new();
     let mut sums: Vec<Vec<f32>> = Vec::new();
     let mut of: Vec<Option<usize>> = vec![None; pieces.len()];
 
+    let mut group_track: Vec<Option<String>> = Vec::new();
+    let track_of = |i: usize| tracks.get(i).and_then(|t| t.as_deref());
+
     let mut order: Vec<usize> = (0..pieces.len())
         .filter(|&i| secs(&pieces[i]) >= GROUP_PIECE_SECS && !pieces[i].embedding.is_empty())
         .collect();
-    order.sort_by(|&a, &b| secs(&pieces[b]).total_cmp(&secs(&pieces[a])));
+    // Tracked pieces first, so an untracked one can join a track's group.
+    order.sort_by(|&a, &b| {
+        track_of(b)
+            .is_some()
+            .cmp(&track_of(a).is_some())
+            .then(secs(&pieces[b]).total_cmp(&secs(&pieces[a])))
+    });
     for &i in &order {
         let piece = &pieces[i];
         let norm = piece.embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -87,17 +109,21 @@ pub fn group_voices(pieces: &[VoicePiece<'_>]) -> (Vec<VoiceGroup>, Vec<Option<u
             continue;
         }
         let weight = secs(piece) as f32 / norm;
-        let index = match nearest(&groups, piece.embedding) {
-            Some((index, distance)) if distance < SAME_VOICE_MAX_DISTANCE => index,
-            _ => {
-                groups.push(VoiceGroup {
-                    embedding: Vec::new(),
-                    secs: 0.0,
-                });
-                sums.push(vec![0.0; piece.embedding.len()]);
-                groups.len() - 1
-            }
+        let known = match track_of(i) {
+            Some(track) => group_track.iter().position(|t| t.as_deref() == Some(track)),
+            None => nearest(&groups, piece.embedding)
+                .filter(|(_, distance)| *distance < SAME_VOICE_MAX_DISTANCE)
+                .map(|(index, _)| index),
         };
+        let index = known.unwrap_or_else(|| {
+            groups.push(VoiceGroup {
+                embedding: Vec::new(),
+                secs: 0.0,
+            });
+            sums.push(vec![0.0; piece.embedding.len()]);
+            group_track.push(track_of(i).map(str::to_string));
+            groups.len() - 1
+        });
         for (sum, value) in sums[index].iter_mut().zip(piece.embedding) {
             *sum += value * weight;
         }
@@ -111,7 +137,15 @@ pub fn group_voices(pieces: &[VoicePiece<'_>]) -> (Vec<VoiceGroup>, Vec<Option<u
         groups[index].secs += secs(piece);
         of[i] = Some(index);
     }
-    (groups, of)
+    // A tracked piece too short to add its sample still belongs to its track.
+    for (i, slot) in of.iter_mut().enumerate() {
+        if slot.is_none() {
+            if let Some(track) = track_of(i) {
+                *slot = group_track.iter().position(|t| t.as_deref() == Some(track));
+            }
+        }
+    }
+    (groups, of, group_track)
 }
 
 /// Give each piece that has no speaker the speaker of the piece next to it in
@@ -238,5 +272,46 @@ mod tests {
         let mut speakers = [Some(1), None, None];
         follow_neighbours(&spans, &mut speakers);
         assert_eq!(speakers, [Some(1), Some(1), None]);
+    }
+
+    #[test]
+    fn a_track_is_one_group_whatever_its_pieces_sound_like() {
+        let (a, b) = (vec![1.0, 0.0], vec![0.0, 1.0]);
+        let pieces = [
+            VoicePiece {
+                start: 0.0,
+                end: 3.0,
+                embedding: &a,
+            },
+            // Same track, a sample that sounds nothing like it, and a scrap.
+            VoicePiece {
+                start: 3.0,
+                end: 5.0,
+                embedding: &b,
+            },
+            VoicePiece {
+                start: 5.0,
+                end: 5.4,
+                embedding: &b,
+            },
+            // No track: joins by voice.
+            VoicePiece {
+                start: 6.0,
+                end: 8.0,
+                embedding: &a,
+            },
+            VoicePiece {
+                start: 9.0,
+                end: 12.0,
+                embedding: &b,
+            },
+        ];
+        let t = |s: &str| Some(s.to_string());
+        let tracks = [t("mic#1"), t("mic#1"), t("mic#1"), None, t("mic#2")];
+        let (groups, of, group_track) = group_voices_by_track(&pieces, &tracks);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(of, vec![Some(0), Some(0), Some(0), Some(0), Some(1)]);
+        assert_eq!(group_track, vec![t("mic#1"), t("mic#2")]);
+        assert!((groups[0].secs - 7.0).abs() < 1e-6);
     }
 }

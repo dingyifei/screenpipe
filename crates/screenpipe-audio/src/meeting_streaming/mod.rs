@@ -9,6 +9,7 @@ mod events;
 mod live_speaker;
 mod net;
 mod selected_engine;
+mod voice_tracks;
 
 pub use config::{MeetingStreamingConfig, MeetingStreamingProvider};
 pub use controller::{start_meeting_streaming_loop, MEETING_STREAMING_REATTACH_EVENT};
@@ -18,4 +19,8 @@ pub use events::{
 };
 pub use live_speaker::{
     install_live_speaker_identifier, MeetingTranscriptSpeaker, MEETING_TRANSCRIPT_SPEAKER_EVENT,
+};
+pub use voice_tracks::{
+    name_track, track_spans, MeetingVoiceActivity, MeetingVoiceLine, MeetingVoiceTrack, TrackSpan,
+    MEETING_VOICE_ACTIVITY_EVENT, MEETING_VOICE_LINE_EVENT, MEETING_VOICE_TRACK_EVENT,
 };

@@ -482,8 +482,15 @@ pub(crate) struct TeachSpeakerRequest {
     id: i64,
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
+    /// Keep the voice already stored and add this one to it: the same person
+    /// in another language or on another microphone. Without it the stored
+    /// voice is replaced.
+    #[serde(default)]
+    add: bool,
 }
 
+/// How many samples one teaching stores, so that a second one fits beside it.
+const TEACH_SAMPLES: usize = screenpipe_db::SPEAKER_MAX_STORED_EMBEDDINGS / 2;
 /// The least speech of one voice a speaker can be taught from.
 const TEACH_MIN_SECS: f64 = 8.0;
 /// A second voice with this share of the main one's speech means the
@@ -635,15 +642,28 @@ pub(crate) async fn teach_speaker_handler(
             "more than one voice was heard; try again with only one person speaking",
         ));
     }
-    state
-        .db
-        .replace_speaker_embeddings(request.id, &samples)
-        .await
-        .map_err(|e| teach_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let samples = &samples[..samples.len().min(TEACH_SAMPLES)];
+    let stored = if request.add {
+        state.db.add_speaker_embeddings(request.id, samples).await
+    } else {
+        state
+            .db
+            .replace_speaker_embeddings(request.id, samples)
+            .await
+            .map(|_| samples.len())
+    }
+    .map_err(|e| teach_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if stored == 0 {
+        return Err(teach_error(
+            StatusCode::BAD_REQUEST,
+            "this voice already has as many samples as it can hold; teach it afresh first",
+        ));
+    }
     Ok(JsonResponse(json!({
         "success": true,
         "seconds": secs,
-        "samples": samples.len().min(screenpipe_db::SPEAKER_MAX_STORED_EMBEDDINGS),
+        "samples": stored,
+        "added": request.add,
     })))
 }
 
