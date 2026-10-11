@@ -492,7 +492,7 @@ async fn known_speaker(state: &AppState, embedding: &[f32], secs: f64) -> Option
 /// pooled sample and its total speech: a lookup per segment cut one narrator
 /// into three speakers and left the short segments with none. A group nobody
 /// matches becomes a new speaker when it holds enough speech. A segment
-/// outside every group is only ever matched, never a new speaker.
+/// outside every group gets no speaker: too short, and next to nobody.
 ///
 /// `recent` are the speakers of the conversation so far; the ones found here
 /// are added to it.
@@ -543,30 +543,7 @@ async fn assign_speakers(
         group_speaker.push(speaker);
     }
     for (index, result) in results.iter_mut().enumerate() {
-        result.speaker_id = match of[index] {
-            Some(group) => group_speaker[group],
-            None => {
-                let secs = result.end - result.start;
-                let voice = &voices[index];
-                if voice.is_empty()
-                    || secs < screenpipe_audio::speaker::identify_gate::MIN_SPEAKER_IDENTIFY_SECS
-                {
-                    None
-                } else {
-                    let known = recent.as_deref().map(|r| r.as_slice()).unwrap_or(&[]);
-                    match state
-                        .db
-                        .match_speaker_from_embedding_recent(voice, known)
-                        .await
-                    {
-                        Ok(screenpipe_db::SpeakerEmbeddingMatch::Matched(speaker)) => {
-                            Some(speaker.id)
-                        }
-                        _ => None,
-                    }
-                }
-            }
-        };
+        result.speaker_id = of[index].and_then(|group| group_speaker[group]);
     }
 }
 
