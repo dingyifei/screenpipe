@@ -248,4 +248,9 @@ impl VadEngine for SileroVad {
     fn set_speech_threshold(&mut self, threshold: Option<f32>) {
         self.speech_threshold_override = threshold;
     }
+
+    fn reset(&mut self) {
+        self.vad.reset();
+        self.prob_history.clear();
+    }
 }

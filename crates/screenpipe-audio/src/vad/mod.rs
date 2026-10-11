@@ -65,6 +65,8 @@ pub trait VadEngine: Send {
     fn audio_type(&mut self, audio_chunk: &[f32]) -> anyhow::Result<VadStatus>;
     /// Override the speech probability threshold. Call with `None` to reset to default.
     fn set_speech_threshold(&mut self, threshold: Option<f32>);
+    /// Forget what was heard so far, so the next audio is judged by itself.
+    fn reset(&mut self) {}
 }
 
 const FRAME_HISTORY: usize = 10; // Number of frames to consider for decision

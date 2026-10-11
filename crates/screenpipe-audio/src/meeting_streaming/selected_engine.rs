@@ -524,6 +524,14 @@ impl VoiceGate {
     /// Share of the chunk the detector calls speech. `None` without a detector.
     async fn speech_ratio(&self, samples_16k: &[f32]) -> Option<f32> {
         let vad = self.vad.as_ref()?;
+        // Each cut is judged by itself. The detector carries state from frame
+        // to frame, and here it is fed the same growing cut again for every
+        // preview, then the finished cut: after a stretch it scored low
+        // (singing, music) the carried state stayed at "no speech" for the
+        // speech that followed, and the live pass went quiet for as long as
+        // nobody paused. Seen on stored audio: every cut after the first 16 s
+        // of two minutes of talk scored 0; with the reset, 13 of 16 pass.
+        vad.lock().await.reset();
         Some(crate::vad::speech_ratio(samples_16k, vad, self.is_output_device).await)
     }
 
