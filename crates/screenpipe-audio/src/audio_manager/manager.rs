@@ -2288,7 +2288,7 @@ impl AudioManager {
             .lock()
             .await
             .clone();
-        let (mut receiver, speech_ratio_ok, _) = crate::speaker::prepare_segments(
+        let (mut receiver, speech_ratio_ok, _) = crate::speaker::prepare_segments_above(
             samples_16k,
             vad,
             segmentation_model_path.as_ref(),
@@ -2297,6 +2297,7 @@ impl AudioManager {
             device,
             is_output_device,
             false,
+            crate::vad::asked_for_min_speech_ratio(),
         )
         .await?;
         if !speech_ratio_ok {

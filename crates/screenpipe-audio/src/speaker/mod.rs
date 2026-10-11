@@ -191,7 +191,7 @@ pub(crate) fn resolve_output_name(output_names: &[String], preferred: &str) -> R
 pub mod embedding_manager;
 pub mod models;
 mod prepare_segments;
-pub use prepare_segments::prepare_segments;
+pub use prepare_segments::{prepare_segments, prepare_segments_above};
 pub mod segment;
 pub mod voice_groups;
 

@@ -102,7 +102,7 @@ pub(crate) async fn identify(
     let segmentation = &identifier.segmentation;
     let extractor = segmentation.embedding_extractor.lock().await.clone()?;
     let model_path = segmentation.segmentation_model_path.lock().await.clone();
-    let (mut receiver, has_speech, _) = crate::speaker::prepare_segments(
+    let (mut receiver, has_speech, _) = crate::speaker::prepare_segments_above(
         samples_16k,
         vad,
         model_path.as_ref(),
@@ -116,6 +116,7 @@ pub(crate) async fn identify(
         device_name,
         is_output_device,
         false,
+        crate::vad::asked_for_min_speech_ratio(),
     )
     .await
     .ok()?;

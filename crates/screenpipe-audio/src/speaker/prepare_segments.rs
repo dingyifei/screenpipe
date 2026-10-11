@@ -29,6 +29,35 @@ pub async fn prepare_segments(
     is_output_device: bool,
     filter_music: bool,
 ) -> Result<(tokio::sync::mpsc::Receiver<SpeechSegment>, bool, f32)> {
+    prepare_segments_above(
+        audio_data,
+        vad_engine,
+        segmentation_model_path,
+        embedding_manager,
+        embedding_extractor,
+        device,
+        is_output_device,
+        filter_music,
+        crate::vad::min_speech_ratio(),
+    )
+    .await
+}
+
+/// [`prepare_segments`] with the speech-ratio threshold given by the caller:
+/// work that was asked for passes `vad::asked_for_min_speech_ratio()`, which
+/// the low-battery pause does not raise.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_segments_above(
+    audio_data: &[f32],
+    vad_engine: Arc<Mutex<Box<dyn VadEngine + Send>>>,
+    segmentation_model_path: Option<&PathBuf>,
+    embedding_manager: Arc<StdMutex<EmbeddingManager>>,
+    embedding_extractor: Option<Arc<StdMutex<EmbeddingExtractor>>>,
+    device: &str,
+    is_output_device: bool,
+    filter_music: bool,
+    current_min_ratio: f32,
+) -> Result<(tokio::sync::mpsc::Receiver<SpeechSegment>, bool, f32)> {
     let mut audio_data = normalize_v2(audio_data);
 
     if filter_music {
@@ -86,7 +115,6 @@ pub async fn prepare_segments(
     }
 
     let speech_ratio = speech_frame_count as f32 / total_frames as f32;
-    let current_min_ratio = crate::vad::min_speech_ratio();
     debug!(
         "device: {}, speech ratio: {}, min_speech_ratio: {}, audio_frames: {}, speech_frames: {}",
         device,

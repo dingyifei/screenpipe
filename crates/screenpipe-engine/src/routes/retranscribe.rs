@@ -12,9 +12,7 @@ use oasgen::{oasgen, OaSchema};
 use screenpipe_audio::core::engine::AudioTranscriptionEngine;
 use screenpipe_audio::transcription::engine::TranscriptionEngine;
 use screenpipe_audio::transcription::VocabularyEntry;
-use screenpipe_audio::vad::{
-    create_vad_engine, min_speech_ratio, speech_ratio, VadEngine, VadEngineEnum,
-};
+use screenpipe_audio::vad::{create_vad_engine, speech_ratio, VadEngine, VadEngineEnum};
 use screenpipe_db::{AudioChunkInfo, NewMeetingTranscriptSegment};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -101,7 +99,7 @@ impl SilenceGate {
             }
         };
         let ratio = speech_ratio(samples_16k, vad, is_output_device).await;
-        let min_ratio = min_speech_ratio();
+        let min_ratio = screenpipe_audio::vad::asked_for_min_speech_ratio();
         debug!(
             "retranscribe: {} speech ratio {:.3} (min {:.3})",
             label, ratio, min_ratio
