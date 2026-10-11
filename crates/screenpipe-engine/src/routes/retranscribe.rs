@@ -139,6 +139,13 @@ pub struct RetranscribeRequest {
     /// Language to tell the engine to expect: a language code, or "auto" for
     /// no hint. Absent uses the recorder's configured languages.
     pub language: Option<String>,
+    /// With `speakers`: the speakers already heard in the conversation these
+    /// chunks belong to. They are matched at the looser limit
+    /// (`SPEAKER_MATCH_RECENT_MAX_DISTANCE`), and every speaker this request
+    /// finds joins them for the chunks after it. Absent (the nightly run):
+    /// every voice is matched at the general limit.
+    #[serde(default)]
+    pub recent_speaker_ids: Option<Vec<i64>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -267,9 +274,11 @@ async fn other_mic_files(
         let file = match cache.iter().find(|f| f.chunk_id == other.id) {
             Some(file) => file.clone(),
             None => {
-                let Ok((samples, sample_rate)) = screenpipe_audio::utils::ffmpeg::read_audio_from_file(
-                    StdPath::new(&other.file_path),
-                ) else {
+                let Ok((samples, sample_rate)) =
+                    screenpipe_audio::utils::ffmpeg::read_audio_from_file(StdPath::new(
+                        &other.file_path,
+                    ))
+                else {
                     continue;
                 };
                 let Ok(samples_16k) = (if sample_rate == 16000 {
@@ -294,14 +303,16 @@ async fn other_mic_files(
         };
         files.entry(device.name).or_default().push(file);
     }
-    let secs_between = |a: DateTime<Utc>, b: DateTime<Utc>| (b - a).num_milliseconds() as f64 / 1000.0;
+    let secs_between =
+        |a: DateTime<Utc>, b: DateTime<Utc>| (b - a).num_milliseconds() as f64 / 1000.0;
     let mut runs: Vec<(f64, OtherMicAudio)> = Vec::new();
     for (other_device, mut device_files) in files {
         device_files.sort_by_key(|f| f.timestamp);
         let mut previous: Option<DateTime<Utc>> = None;
         for file in device_files {
-            let continues =
-                previous.is_some_and(|p| SAME_RECORDING_GAP_SECS.contains(&secs_between(p, file.timestamp)));
+            let continues = previous.is_some_and(|p| {
+                SAME_RECORDING_GAP_SECS.contains(&secs_between(p, file.timestamp))
+            });
             previous = Some(file.timestamp);
             match runs.last_mut() {
                 Some((_, run)) if continues => {
@@ -440,10 +451,15 @@ async fn covered_by_previous(state: &AppState, chunk: &AudioChunkInfo, device_na
 }
 
 /// The first seconds of the file that continues this chunk's recording, at 16 kHz.
-async fn next_file_head(state: &AppState, chunk: &AudioChunkInfo, device_name: &str) -> Option<Vec<f32>> {
+async fn next_file_head(
+    state: &AppState,
+    chunk: &AudioChunkInfo,
+    device_name: &str,
+) -> Option<Vec<f32>> {
     let next = neighbour_chunk(state, chunk, device_name, true).await?;
     let (samples, sample_rate) =
-        screenpipe_audio::utils::ffmpeg::read_audio_from_file(StdPath::new(&next.file_path)).ok()?;
+        screenpipe_audio::utils::ffmpeg::read_audio_from_file(StdPath::new(&next.file_path))
+            .ok()?;
     let head = &samples[..samples.len().min(NEXT_HEAD_SECS * sample_rate as usize)];
     if sample_rate == 16000 {
         Some(head.to_vec())
@@ -456,6 +472,8 @@ async fn next_file_head(state: &AppState, chunk: &AudioChunkInfo, device_name: &
 /// speaking: the half-second scrap at the end of a file matched a different
 /// stored speaker than the rest of its own sentence.
 const MIN_SPEAKER_SECS: f64 = 2.0;
+/// How many speakers of a conversation are carried along as "already heard".
+const RECENT_SPEAKERS_MAX: usize = 64;
 
 /// The stored speaker a piece of speech matches, without creating or updating
 /// one. `None` for a piece too short to tell.
@@ -466,6 +484,89 @@ async fn known_speaker(state: &AppState, embedding: &[f32], secs: f64) -> Option
     match state.db.match_speaker_from_embedding(embedding).await {
         Ok(screenpipe_db::SpeakerEmbeddingMatch::Matched(speaker)) => Some(speaker.id),
         _ => None,
+    }
+}
+
+/// Give each segment of one file its speaker. The segments are grouped by
+/// voice first (`group_voices`) and each group is looked up once, with its
+/// pooled sample and its total speech: a lookup per segment cut one narrator
+/// into three speakers and left the short segments with none. A group nobody
+/// matches becomes a new speaker when it holds enough speech. A segment
+/// outside every group is only ever matched, never a new speaker.
+///
+/// `recent` are the speakers of the conversation so far; the ones found here
+/// are added to it.
+async fn assign_speakers(
+    state: &AppState,
+    results: &mut [RetranscribeSegmentResult],
+    voices: &[Vec<f32>],
+    mut recent: Option<&mut Vec<i64>>,
+    chunk_id: i64,
+) {
+    use screenpipe_audio::speaker::voice_groups::{group_voices, VoicePiece};
+    let pieces: Vec<VoicePiece<'_>> = results
+        .iter()
+        .zip(voices)
+        .map(|(result, voice)| VoicePiece {
+            start: result.start,
+            end: result.end,
+            embedding: voice,
+        })
+        .collect();
+    let (groups, of) = group_voices(&pieces);
+    drop(pieces);
+    let mut group_speaker: Vec<Option<i64>> = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let known = recent.as_deref().map(|r| r.as_slice()).unwrap_or(&[]);
+        let speaker = match screenpipe_audio::transcription::get_or_create_speaker_in_conversation(
+            &state.db,
+            &group.embedding,
+            group.secs,
+            known,
+        )
+        .await
+        {
+            Ok(speaker) => speaker.map(|s| s.id),
+            Err(e) => {
+                warn!(
+                    "retranscribe: speaker lookup failed for chunk {}: {}",
+                    chunk_id, e
+                );
+                None
+            }
+        };
+        if let (Some(id), Some(recent)) = (speaker, recent.as_deref_mut()) {
+            if !recent.contains(&id) && recent.len() < RECENT_SPEAKERS_MAX {
+                recent.push(id);
+            }
+        }
+        group_speaker.push(speaker);
+    }
+    for (index, result) in results.iter_mut().enumerate() {
+        result.speaker_id = match of[index] {
+            Some(group) => group_speaker[group],
+            None => {
+                let secs = result.end - result.start;
+                let voice = &voices[index];
+                if voice.is_empty()
+                    || secs < screenpipe_audio::speaker::identify_gate::MIN_SPEAKER_IDENTIFY_SECS
+                {
+                    None
+                } else {
+                    let known = recent.as_deref().map(|r| r.as_slice()).unwrap_or(&[]);
+                    match state
+                        .db
+                        .match_speaker_from_embedding_recent(voice, known)
+                        .await
+                    {
+                        Ok(screenpipe_db::SpeakerEmbeddingMatch::Matched(speaker)) => {
+                            Some(speaker.id)
+                        }
+                        _ => None,
+                    }
+                }
+            }
+        };
     }
 }
 
@@ -497,6 +598,7 @@ async fn transcribe_speaker_segments(
     chunk_id: i64,
     other_mics: &[(f64, OtherMicAudio)],
     chunk: &AudioChunkInfo,
+    mut recent: Option<&mut Vec<i64>>,
 ) -> Option<Vec<RetranscribeSegmentResult>> {
     let resampled;
     let samples_16k: &[f32] = if sample_rate == 16000 {
@@ -540,6 +642,8 @@ async fn transcribe_speaker_segments(
         screenpipe_audio::same_utterance::envelope_db(samples_16k, 16000)
     };
     let mut results = Vec::with_capacity(segments.len());
+    // One voice sample per kept segment, in step with `results`.
+    let mut voices: Vec<Vec<f32>> = Vec::with_capacity(segments.len());
     let last = segments.len() - 1;
     for (index, mut segment) in segments.into_iter().enumerate() {
         match head_segment(segment.start, segment.end, covered) {
@@ -581,8 +685,7 @@ async fn transcribe_speaker_segments(
                     });
                 if let Some(rest) = rest {
                     let (mine, theirs) = (
-                        known_speaker(state, &segment.embedding, segment.end - segment.start)
-                            .await,
+                        known_speaker(state, &segment.embedding, segment.end - segment.start).await,
                         known_speaker(state, &rest.embedding, rest.end - rest.start).await,
                     );
                     if mine.is_none() || theirs.is_none() || mine == theirs {
@@ -662,33 +765,30 @@ async fn transcribe_speaker_segments(
                 _ => {}
             }
         }
-        let speaker_id = if segment.embedding.is_empty() {
-            None
+        // Who is speaking is decided below, for the file as a whole. The
+        // sample is taken over the whole segment: the diarizer's own covers
+        // its first two seconds.
+        let voice = if segment.sample_rate == 16000 {
+            state.audio_manager.voice_embedding(&segment.samples).await
         } else {
-            match screenpipe_audio::transcription::get_or_create_speaker_from_embedding(
-                &state.db,
-                &segment.embedding,
-                duration,
-            )
-            .await
-            {
-                Ok(speaker) => speaker.map(|s| s.id),
-                Err(e) => {
-                    warn!(
-                        "retranscribe: speaker lookup failed for chunk {}: {}",
-                        chunk_id, e
-                    );
-                    None
-                }
-            }
+            None
         };
+        voices.push(voice.unwrap_or(segment.embedding));
         results.push(RetranscribeSegmentResult {
             start: segment.start.max(0.0),
             end: segment.end.max(segment.start),
-            speaker_id,
+            speaker_id: None,
             text,
         });
     }
+    assign_speakers(
+        state,
+        &mut results,
+        &voices,
+        recent.as_deref_mut(),
+        chunk_id,
+    )
+    .await;
     Some(results)
 }
 
@@ -760,9 +860,9 @@ pub struct AudioReconciliationDropResponse {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct ChunkDevice {
-    name: String,
-    is_input: bool,
+pub(crate) struct ChunkDevice {
+    pub(crate) name: String,
+    pub(crate) is_input: bool,
 }
 
 #[derive(Debug)]
@@ -968,6 +1068,11 @@ pub async fn retranscribe_handler(
     // 2. Get transcription config from audio manager
     let audio_manager = &state.audio_manager;
     let vocabulary = request.vocabulary.unwrap_or_default();
+    // Capped: the list rides along in a query.
+    let mut recent_speakers: Option<Vec<i64>> = request
+        .recent_speaker_ids
+        .clone()
+        .map(|ids| ids.into_iter().take(RECENT_SPEAKERS_MAX).collect());
     let speaker_vad = if request.speakers {
         Some(audio_manager.detached_vad().await)
     } else {
@@ -1180,6 +1285,7 @@ pub async fn retranscribe_handler(
                 chunk.id,
                 &other_mics,
                 chunk,
+                recent_speakers.as_mut(),
             )
             .await
             {
@@ -1735,7 +1841,7 @@ fn chunk_device(chunk: &AudioChunkInfo) -> ChunkDevice {
 /// Device and direction for the chunk retranscribe route: from the file name
 /// (`<Device Name> (input|output)_<timestamp>.mp4`), and from the joined
 /// transcription row only when the name carries no direction.
-fn retranscribe_chunk_device(chunk: &AudioChunkInfo) -> ChunkDevice {
+pub(crate) fn retranscribe_chunk_device(chunk: &AudioChunkInfo) -> ChunkDevice {
     if chunk.file_path.contains(" (input)_") || chunk.file_path.contains(" (output)_") {
         return extract_device_from_path(&chunk.file_path);
     }

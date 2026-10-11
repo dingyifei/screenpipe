@@ -193,6 +193,7 @@ pub mod models;
 mod prepare_segments;
 pub use prepare_segments::prepare_segments;
 pub mod segment;
+pub mod voice_groups;
 
 #[cfg(test)]
 mod tests {

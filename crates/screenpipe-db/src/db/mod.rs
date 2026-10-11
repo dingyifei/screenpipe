@@ -479,6 +479,7 @@ mod setup;
 pub(crate) use setup::register_sqlite_extensions;
 mod source_identity;
 mod speakers;
+pub use speakers::{SPEAKER_MATCH_RECENT_MAX_DISTANCE, SPEAKER_MAX_STORED_EMBEDDINGS};
 mod tags;
 mod text_positions;
 mod write_ops;

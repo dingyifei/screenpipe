@@ -218,7 +218,10 @@ mod tests {
     fn finds_a_louder_delayed_copy() {
         let mine = speech(1, 300);
         let other = shifted(&mine, 9, 8.0);
-        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 0, 25, false), Some(59));
+        assert_eq!(
+            louder_copy_at(&mine, (50, 250), &other, 0, 25, false),
+            Some(59)
+        );
     }
 
     #[test]
@@ -244,8 +247,14 @@ mod tests {
         // The room mic keeps a noise floor between syllables; the headset goes silent there.
         let headset = speech(1, 300);
         let room: Vec<f32> = headset.iter().map(|v| (v - 4.0).max(-44.0)).collect();
-        let gated: Vec<f32> = headset.iter().map(|&v| if v < -50.0 { FLOOR_DB } else { v }).collect();
-        assert_eq!(louder_copy_at(&room, (50, 250), &gated, 0, 25, false), Some(50));
+        let gated: Vec<f32> = headset
+            .iter()
+            .map(|&v| if v < -50.0 { FLOOR_DB } else { v })
+            .collect();
+        assert_eq!(
+            louder_copy_at(&room, (50, 250), &gated, 0, 25, false),
+            Some(50)
+        );
         assert_eq!(louder_copy_at(&gated, (50, 250), &room, 0, 25, true), None);
     }
 
@@ -261,21 +270,30 @@ mod tests {
         let mine = speech(1, 300);
         let other = shifted(&mine, 60, 8.0);
         assert_eq!(louder_copy_at(&mine, (50, 250), &other, 0, 25, false), None);
-        assert_eq!(louder_copy_at(&mine, (50, 250), &other, 60, 25, false), Some(110));
+        assert_eq!(
+            louder_copy_at(&mine, (50, 250), &other, 60, 25, false),
+            Some(110)
+        );
     }
 
     #[test]
     fn a_short_span_is_judged_with_its_surroundings() {
         let mine = speech(3, 400);
         let other = shifted(&mine, 4, 6.0);
-        assert_eq!(louder_copy_at(&mine, (200, 215), &other, 0, 25, false), Some(204));
+        assert_eq!(
+            louder_copy_at(&mine, (200, 215), &other, 0, 25, false),
+            Some(204)
+        );
     }
 
     #[test]
     fn a_span_running_off_the_other_file_is_left_alone() {
         let mine = speech(1, 300);
         let other = shifted(&mine, 0, 8.0);
-        assert_eq!(louder_copy_at(&mine, (150, 300), &other[..200], 0, 25, false), None);
+        assert_eq!(
+            louder_copy_at(&mine, (150, 300), &other[..200], 0, 25, false),
+            None
+        );
     }
 
     #[test]

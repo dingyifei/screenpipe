@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use screenpipe_core::Language;
+use serde::Serialize;
 use tokio::{
     sync::{mpsc, Notify, RwLock},
     task::JoinHandle,
     time::{interval, Duration},
 };
-use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -152,7 +152,9 @@ fn note_mic_line(meeting_id: i64, device_name: &str, line: MicLine) {
         .entry(device_name.to_string())
         .or_default()
         .lines;
-    let oldest = line.end_ms.saturating_sub(MIC_LINES_KEPT.as_millis() as u64);
+    let oldest = line
+        .end_ms
+        .saturating_sub(MIC_LINES_KEPT.as_millis() as u64);
     lines.push_back(line);
     while lines.front().is_some_and(|l| l.end_ms < oldest) {
         lines.pop_front();
@@ -641,8 +643,8 @@ async fn show_preview(
     if !voice_gate.hears_speech(&chunk.samples).await {
         return;
     }
-    let end_ms = chunk.captured_at_unix_ms
-        + (chunk.samples.len() as u64 * 1000) / LIVE_SAMPLE_RATE as u64;
+    let end_ms =
+        chunk.captured_at_unix_ms + (chunk.samples.len() as u64 * 1000) / LIVE_SAMPLE_RATE as u64;
     if device_type == "input"
         && louder_mic(meeting_id, device_name, chunk.captured_at_unix_ms, end_ms).is_some()
     {
@@ -784,8 +786,8 @@ async fn transcribe_chunk(
         .and_then(|v| v.name.clone())
         .or(device_speaker_name);
 
-    let end_ms = chunk.captured_at_unix_ms
-        + (chunk.samples.len() as u64 * 1000) / LIVE_SAMPLE_RATE as u64;
+    let end_ms =
+        chunk.captured_at_unix_ms + (chunk.samples.len() as u64 * 1000) / LIVE_SAMPLE_RATE as u64;
     let line = LiveLine {
         delta: MeetingTranscriptDelta {
             meeting_id,

@@ -45,6 +45,7 @@ mod transcription_result;
 
 pub use diarization::{TranscriptionDiarizationSegment, TranscriptionOutput};
 pub use transcription_result::get_or_create_speaker_from_embedding;
+pub use transcription_result::get_or_create_speaker_in_conversation;
 pub use transcription_result::process_transcription_result;
 pub use transcription_result::TranscriptionResult;
 mod handle_new_transcript;
