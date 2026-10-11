@@ -549,9 +549,12 @@ async fn transcribe_speaker_segments(
             && segment.end >= chunk_secs - BOUNDARY_SECS
         {
             if let Some(head) = next_file_head(state, chunk, device_name).await {
+                // A detector of its own: Silero carries state from frame to
+                // frame, and this look ahead must not colour the next chunk's pass.
+                let head_vad = state.audio_manager.detached_vad().await;
                 let rest = state
                     .audio_manager
-                    .speech_segments(&head, vad.clone(), device_name, is_output_device)
+                    .speech_segments(&head, head_vad, device_name, is_output_device)
                     .await
                     .ok()
                     .and_then(|segments| segments.into_iter().next())
@@ -1167,7 +1170,10 @@ pub async fn retranscribe_handler(
                         transcription: s.text.clone(),
                         speaker_id: s.speaker_id,
                         start_time: s.start,
-                        end_time: s.end.min(duration_secs).max(s.start),
+                        // Not clamped to the file: a sentence joined with the
+                        // start of the next file ends past it, and that overhang
+                        // is what tells the next file its head is taken.
+                        end_time: s.end.max(s.start),
                     })
                     .collect();
                 if let Err(e) = state
