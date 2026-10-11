@@ -116,6 +116,11 @@ const NAME_RETRY_GROWTH: f32 = 1.5;
 const SAMPLE_MAX_SECS: f32 = 20.0;
 /// Audio kept for voice samples.
 const AUDIO_KEPT_SECS: u64 = 45;
+/// Blocks of audio that may wait for the helper. At the capture path's block
+/// size this is tens of seconds: a helper further behind than that is stuck.
+const AUDIO_QUEUE_PUSHES: usize = 2_000;
+/// How long the helper gets to exit once its input is closed.
+const HELPER_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// A change of track this far into a cut ends the cut there.
 const MIN_CUT_BEFORE_CHANGE_MS: u64 = 1_000;
 
@@ -410,8 +415,8 @@ pub(crate) struct VoiceTracker {
     device_name: String,
     device_type: String,
     timeline: Arc<Mutex<Timeline>>,
-    audio_tx: Mutex<Option<std::sync::mpsc::Sender<Vec<f32>>>>,
-    child: Mutex<Option<Child>>,
+    audio_tx: Mutex<Option<std::sync::mpsc::SyncSender<Vec<f32>>>>,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 fn trackers() -> std::sync::MutexGuard<'static, HashMap<String, Arc<VoiceTracker>>> {
@@ -458,14 +463,14 @@ impl VoiceTracker {
             .ok()?;
         let mut stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
-        let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(AUDIO_QUEUE_PUSHES);
         let tracker = Arc::new(Self {
             meeting_id,
             device_name: device_name.to_string(),
             device_type: device_type.to_string(),
             timeline: Arc::new(Mutex::new(Timeline::default())),
             audio_tx: Mutex::new(Some(audio_tx)),
-            child: Mutex::new(Some(child)),
+            child: Arc::new(Mutex::new(Some(child))),
         });
 
         // Writing blocks when the helper is behind; the capture path must not.
@@ -508,23 +513,50 @@ impl VoiceTracker {
                 timeline.audio_start += drop as u64;
             }
         }
-        if let Some(tx) = self
-            .audio_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            let _ = tx.send(samples.to_vec());
+        let full = {
+            let tx = self.audio_tx.lock().unwrap_or_else(|e| e.into_inner());
+            match tx.as_ref() {
+                Some(tx) => matches!(
+                    tx.try_send(samples.to_vec()),
+                    Err(std::sync::mpsc::TrySendError::Full(_))
+                ),
+                None => false,
+            }
+        };
+        if full {
+            // The helper has stopped reading. Skipping a block would put every
+            // later frame at the wrong time, so the device goes untracked for
+            // the rest of the session and its lines are labelled per cut.
+            warn!(
+                "voice tracks: the helper for {} is not keeping up; stopped following it",
+                self.device_name
+            );
+            self.finish();
         }
     }
 
     /// No more audio: let the helper finish and exit. The timeline stays
     /// readable for the 30-second pass that follows the session.
     pub(crate) fn finish(&self) {
-        self.audio_tx
+        let had_audio = self
+            .audio_tx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take();
+            .take()
+            .is_some();
+        if !had_audio {
+            return;
+        }
+        // The helper exits when its input closes. One that does not is killed,
+        // which also ends the thread reading from it.
+        let child = Arc::clone(&self.child);
+        std::thread::spawn(move || {
+            std::thread::sleep(HELPER_EXIT_GRACE);
+            if let Some(mut child) = child.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        });
     }
 
     pub(crate) fn label(&self, start_ms: u64, end_ms: u64) -> Option<TrackLabel> {
@@ -757,6 +789,39 @@ pub fn name_track(device_name: &str, track: &str, speaker_id: i64, speaker_name:
             speaker_name,
         },
     );
+}
+
+/// A stored speaker was merged into another: tracks recognised as the first
+/// are the second from now on, and say so.
+pub fn speaker_merged(from: i64, into: i64, into_name: Option<String>) {
+    let all: Vec<Arc<VoiceTracker>> = trackers().values().cloned().collect();
+    for tracker in all {
+        let renamed: Vec<String> = {
+            let mut timeline = tracker.timeline.lock().unwrap_or_else(|e| e.into_inner());
+            timeline
+                .tracks
+                .iter_mut()
+                .filter(|track| track.speaker.as_ref().map(|s| s.0) == Some(from))
+                .map(|track| {
+                    track.speaker = Some((into, into_name.clone()));
+                    track.key.clone()
+                })
+                .collect()
+        };
+        for track in renamed {
+            let _ = screenpipe_events::send_event(
+                MEETING_VOICE_TRACK_EVENT,
+                MeetingVoiceTrack {
+                    meeting_id: tracker.meeting_id,
+                    device_name: tracker.device_name.clone(),
+                    device_type: tracker.device_type.clone(),
+                    track,
+                    speaker_id: into,
+                    speaker_name: into_name.clone(),
+                },
+            );
+        }
+    }
 }
 
 #[cfg(test)]
