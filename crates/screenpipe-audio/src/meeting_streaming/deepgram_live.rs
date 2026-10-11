@@ -797,6 +797,7 @@ mod tests {
             persist_finals: true,
             keyterms: vec![],
             openai_compatible_fallback: false,
+            live_previews: false,
         };
         let mut url = Url::parse(&config.endpoint).unwrap();
         configure_live_query(&mut url, &config);
@@ -827,6 +828,7 @@ mod tests {
                 "Arvind".to_string(),
             ],
             openai_compatible_fallback: false,
+            live_previews: false,
         };
         let mut url = Url::parse(&config.endpoint).unwrap();
         configure_live_query(&mut url, &config);
@@ -907,6 +909,7 @@ mod tests {
             persist_finals: true,
             keyterms: vec![],
             openai_compatible_fallback: false,
+            live_previews: false,
         };
 
         let mut url = Url::parse(&config.endpoint).unwrap();

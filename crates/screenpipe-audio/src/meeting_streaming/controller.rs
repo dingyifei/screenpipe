@@ -168,6 +168,7 @@ pub fn start_meeting_streaming_loop(
                     meeting.title,
                     attendee_keyterms,
                     None,
+                    false,
                 )
                 .await;
             }
@@ -204,6 +205,7 @@ pub fn start_meeting_streaming_loop(
                         event.data.display_title().map(str::to_string),
                         attendee_keyterms,
                         event.data.language.clone(),
+                        event.data.live_previews,
                     )
                     .await;
                 }
@@ -245,6 +247,7 @@ pub fn start_meeting_streaming_loop(
                         event.data.display_title().map(str::to_string),
                         attendee_keyterms,
                         event.data.language.clone(),
+                        event.data.live_previews,
                     )
                     .await;
                 }
@@ -400,6 +403,7 @@ async fn start_streaming_session(
     title: Option<String>,
     extra_keyterms: Vec<String>,
     language: Option<String>,
+    live_previews: bool,
 ) {
     if let Some(previous) = active.take() {
         emit_session_ended(previous);
@@ -411,6 +415,7 @@ async fn start_streaming_session(
     if language.is_some() {
         session_config.language = language;
     }
+    session_config.live_previews = live_previews;
     // Bias live transcription toward this meeting's calendar attendee names, on
     // top of the user's vocabulary. Granola/Notion lean on exactly this — when
     // you know who's in the room, proper-noun accuracy jumps (measured: name WER
@@ -1383,6 +1388,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            false,
         )
         .await;
 
@@ -1410,6 +1416,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            false,
         )
         .await;
 

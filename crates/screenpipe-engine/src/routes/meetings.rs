@@ -79,6 +79,10 @@ pub struct StartMeetingRequest {
     /// Speech language for this meeting's live transcription: a language code,
     /// or "auto" for no hint. Absent keeps the configured behaviour.
     pub language: Option<String>,
+    /// Show each sentence of this meeting's live transcription while it is
+    /// still being spoken. More model calls; off when absent.
+    #[serde(default)]
+    pub live_previews: bool,
 }
 
 /// Whether calendar-sourced `title`/`attendees` may be written to this meeting.
@@ -1150,7 +1154,8 @@ pub(crate) async fn start_meeting_handler(
             } else {
                 meeting.detection_source.as_str()
             },
-            "language": language
+            "language": language,
+            "live_previews": body.live_previews
         }),
     ) {
         tracing::warn!("failed to emit meeting_started event: {}", e);
