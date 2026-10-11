@@ -11,8 +11,15 @@
 //! stays within about 0.6 of its other sentences and different voices sit at
 //! 0.7 and beyond.
 
-/// A piece this long can found a voice group. Shorter ones only join one.
-pub const GROUP_SEED_SECS: f64 = 2.0;
+/// A piece this long can found a voice group. Shorter ones only follow one.
+/// The diarizer cuts speech into two-second samples, so a piece of exactly
+/// two seconds is usually a scrap it split off a longer stretch; counted as a
+/// voice, those scraps founded a speaker that then drew in short pieces of
+/// everybody.
+pub const GROUP_SEED_SECS: f64 = 2.5;
+/// A short piece far from any speech in time joins a group only this close:
+/// short samples resemble each other more than they resemble their speaker.
+pub const SHORT_PIECE_MAX_DISTANCE: f32 = 0.5;
 /// Two samples of one voice are within this cosine distance.
 pub const SAME_VOICE_MAX_DISTANCE: f32 = 0.6;
 /// A short piece with no voice of its own belongs to the speech this close to
@@ -63,10 +70,11 @@ fn nearest(groups: &[VoiceGroup], embedding: &[f32]) -> Option<(usize, f32)> {
 ///
 /// Pieces of [`GROUP_SEED_SECS`] or more are placed longest first: each joins
 /// the nearest group within [`SAME_VOICE_MAX_DISTANCE`] or founds one. A
-/// shorter piece joins a group it sounds like; failing that it goes with the
-/// placed piece next to it in time (the one before, else the one after,
-/// within [`NEIGHBOUR_GAP_SECS`]), because a short piece is far more often the
-/// same person carrying on than its own noisy sample suggests.
+/// shorter piece goes with the placed piece next to it in time (the one
+/// before, else the one after, within [`NEIGHBOUR_GAP_SECS`]): it is far more
+/// often the same person carrying on than its own noisy sample suggests. With
+/// nobody next to it, it joins a group only when it sounds much like it
+/// ([`SHORT_PIECE_MAX_DISTANCE`]).
 pub fn group_voices(pieces: &[VoicePiece<'_>]) -> (Vec<VoiceGroup>, Vec<Option<usize>>) {
     let secs = |p: &VoicePiece<'_>| (p.end - p.start).max(0.0);
     let mut groups: Vec<VoiceGroup> = Vec::new();
@@ -115,12 +123,6 @@ pub fn group_voices(pieces: &[VoicePiece<'_>]) -> (Vec<VoiceGroup>, Vec<Option<u
             continue;
         }
         let piece = &pieces[i];
-        if let Some((index, distance)) = nearest(&groups, piece.embedding) {
-            if distance < SAME_VOICE_MAX_DISTANCE {
-                of[i] = Some(index);
-                continue;
-            }
-        }
         let before = (0..pieces.len())
             .filter(|&j| placed[j].is_some() && pieces[j].end <= piece.start + 1e-6)
             .max_by(|&a, &b| pieces[a].end.total_cmp(&pieces[b].end))
@@ -129,7 +131,11 @@ pub fn group_voices(pieces: &[VoicePiece<'_>]) -> (Vec<VoiceGroup>, Vec<Option<u
             .filter(|&j| placed[j].is_some() && pieces[j].start + 1e-6 >= piece.end)
             .min_by(|&a, &b| pieces[a].start.total_cmp(&pieces[b].start))
             .filter(|&j| pieces[j].start - piece.end <= NEIGHBOUR_GAP_SECS);
-        of[i] = before.or(after).and_then(|j| placed[j]);
+        of[i] = before.or(after).and_then(|j| placed[j]).or_else(|| {
+            nearest(&groups, piece.embedding)
+                .filter(|(_, distance)| *distance < SHORT_PIECE_MAX_DISTANCE)
+                .map(|(index, _)| index)
+        });
     }
     (groups, of)
 }
@@ -159,12 +165,12 @@ mod tests {
         let (a, b, c) = (voice(0.0), voice(40.0), voice(60.0));
         let (groups, of) = group_voices(&[
             piece(0.0, 6.0, &a),
-            piece(7.0, 9.5, &b),
+            piece(7.0, 10.0, &b),
             piece(12.0, 16.0, &c),
         ]);
         assert_eq!(groups.len(), 1);
         assert_eq!(of, vec![Some(0), Some(0), Some(0)]);
-        assert!((groups[0].secs - 12.5).abs() < 1e-9);
+        assert!((groups[0].secs - 13.0).abs() < 1e-9);
     }
 
     #[test]
@@ -204,14 +210,22 @@ mod tests {
     }
 
     #[test]
-    fn a_short_piece_that_sounds_like_a_group_joins_it_over_its_neighbour() {
-        let (a, b) = (voice(0.0), voice(90.0));
+    fn a_short_piece_alone_joins_only_a_group_it_sounds_much_like() {
+        // 40 degrees is a distance of 0.23, 66 degrees one of 0.59.
+        let (a, near, far) = (voice(0.0), voice(40.0), voice(66.0));
         let (_, of) = group_voices(&[
             piece(0.0, 4.0, &a),
-            piece(4.2, 5.0, &b), // b's interjection right after a
-            piece(10.0, 14.0, &b),
+            piece(10.0, 11.0, &near),
+            piece(20.0, 21.0, &far),
         ]);
-        assert_eq!(of[1], of[2]);
+        assert_eq!(of, vec![Some(0), Some(0), None]);
+    }
+
+    #[test]
+    fn a_two_second_scrap_cannot_found_a_voice() {
+        let (a, odd) = (voice(0.0), voice(90.0));
+        let (groups, _) = group_voices(&[piece(0.0, 4.0, &a), piece(10.0, 12.0, &odd)]);
+        assert_eq!(groups.len(), 1);
     }
 
     #[test]
