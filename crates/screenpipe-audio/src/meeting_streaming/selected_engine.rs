@@ -42,6 +42,11 @@ const PAUSE_TAIL: Duration = Duration::from_millis(400);
 /// Tail energy, relative to the whole buffer, below which the speaker has paused.
 const PAUSE_RELATIVE_RMS: f32 = 0.35;
 const MIN_LIVE_RMS: f32 = 0.003;
+/// While a sentence is still being spoken, what there is of it so far is
+/// transcribed again each time it has grown by this much, and shown in place
+/// of the last attempt. The speech model takes whole clips only, so this is
+/// what stands in for word-by-word output.
+const PREVIEW_EVERY: Duration = Duration::from_secs(1);
 
 /// How far apart two microphones may stamp the same sound. A Bluetooth mic
 /// trails a built-in one by a few hundred milliseconds.
@@ -318,12 +323,28 @@ struct ChunkMailbox {
     latest: Mutex<Option<LiveChunk>>,
     notify: Notify,
     closed: AtomicBool,
+    /// The transcriber is in the middle of a chunk.
+    busy: AtomicBool,
 }
 
 impl ChunkMailbox {
     fn put(&self, chunk: LiveChunk) {
         *self.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(chunk);
         self.notify.notify_one();
+    }
+
+    /// Offer a preview of an unfinished cut. Taken only when nothing is
+    /// waiting and the transcriber is idle: a preview must never replace a
+    /// finished cut, nor queue up behind a slow model. Returns whether it was taken.
+    fn put_preview(&self, chunk: LiveChunk) -> bool {
+        let mut latest = self.latest.lock().unwrap_or_else(|e| e.into_inner());
+        if latest.is_some() || self.busy.load(Ordering::SeqCst) {
+            return false;
+        }
+        *latest = Some(chunk);
+        drop(latest);
+        self.notify.notify_one();
+        true
     }
 
     fn take(&self) -> Option<LiveChunk> {
@@ -350,6 +371,8 @@ async fn ingest_loop(
     let mut buffer = LiveChunkBuffer::default();
     let mut resampler: Option<StreamResampler> = None;
     let mut flush_tick = interval(FLUSH_TICK);
+    // How much of the current buffer the last preview covered.
+    let mut previewed = 0usize;
 
     loop {
         tokio::select! {
@@ -375,6 +398,7 @@ async fn ingest_loop(
                 buffer.push(samples, frame.captured_at_unix_ms);
                 if buffer.duration() >= LIVE_CHUNK_TARGET {
                     hand_off(&mut buffer, &mailbox);
+                    previewed = 0;
                 }
             }
             _ = flush_tick.tick() => {
@@ -383,6 +407,14 @@ async fn ingest_loop(
                 // caption line each; a pause is a sentence or phrase boundary.
                 if buffer.duration() >= LIVE_CHUNK_MIN && ends_in_pause(&buffer.samples) {
                     hand_off(&mut buffer, &mailbox);
+                    previewed = 0;
+                } else if preview_due(buffer.samples.len(), previewed) {
+                    if let Some(preview) = buffer.preview() {
+                        let covered = preview.samples.len();
+                        if mailbox.put_preview(preview) {
+                            previewed = covered;
+                        }
+                    }
                 }
             }
         }
@@ -401,6 +433,12 @@ fn ends_in_pause(samples: &[f32]) -> bool {
     }
     let tail = rms(&samples[samples.len() - tail_len..]);
     tail < MIN_LIVE_RMS || tail < PAUSE_RELATIVE_RMS * rms(samples)
+}
+
+/// The unfinished cut has grown by [`PREVIEW_EVERY`] since it was last previewed.
+fn preview_due(buffered: usize, previewed: usize) -> bool {
+    let step = (PREVIEW_EVERY.as_secs_f32() * LIVE_SAMPLE_RATE as f32) as usize;
+    buffered >= previewed + step
 }
 
 /// Take the buffered chunk and hand it to the mailbox, skipping silent audio so
@@ -450,6 +488,14 @@ impl VoiceGate {
         Some(crate::vad::speech_ratio(samples_16k, vad, self.is_output_device).await)
     }
 
+    /// `true` when a preview is worth transcribing. Not announced: the finished cut will be.
+    async fn hears_speech(&self, samples_16k: &[f32]) -> bool {
+        match self.speech_ratio(samples_16k).await {
+            Some(ratio) => ratio > crate::vad::min_speech_ratio(),
+            None => true,
+        }
+    }
+
     /// `true` when the chunk should be transcribed, announcing the verdict.
     /// Without a detector nothing is gated and nothing is announced.
     async fn passes(
@@ -493,32 +539,48 @@ async fn transcribe_loop(
     device_type: String,
     model: Option<String>,
 ) -> Result<()> {
-    let mut sequence: u64 = 0;
     let voice_gate = VoiceGate::new(device_type == "output").await;
     let speaker_vad = super::live_speaker::new_live_vad().await;
     loop {
         mailbox.notify.notified().await;
         while let Some(chunk) = mailbox.take() {
-            if !voice_gate
+            mailbox.busy.store(true, Ordering::SeqCst);
+            let outcome = if chunk.preview {
+                show_preview(
+                    chunk,
+                    &voice_gate,
+                    &mut session,
+                    &config,
+                    meeting_id,
+                    &stream_id,
+                    &device_name,
+                    &device_type,
+                    model.clone(),
+                )
+                .await;
+                Ok(())
+            } else if !voice_gate
                 .passes(&chunk.samples, meeting_id, &device_name, &device_type)
                 .await
             {
                 debug!("meeting streaming: selected-engine live chunk had no speech; skipping");
-                continue;
-            }
-            transcribe_chunk(
-                chunk,
-                &mut session,
-                &config,
-                meeting_id,
-                &stream_id,
-                &device_name,
-                &device_type,
-                model.clone(),
-                &mut sequence,
-                speaker_vad.as_ref(),
-            )
-            .await?;
+                Ok(())
+            } else {
+                transcribe_chunk(
+                    chunk,
+                    &mut session,
+                    &config,
+                    meeting_id,
+                    &stream_id,
+                    &device_name,
+                    &device_type,
+                    model.clone(),
+                    speaker_vad.as_ref(),
+                )
+                .await
+            };
+            mailbox.busy.store(false, Ordering::SeqCst);
+            outcome?;
         }
         if mailbox.is_closed() {
             break;
@@ -526,9 +588,10 @@ async fn transcribe_loop(
     }
     // A chunk can land between the last take and the close check; drain it.
     while let Some(chunk) = mailbox.take() {
-        if !voice_gate
-            .passes(&chunk.samples, meeting_id, &device_name, &device_type)
-            .await
+        if chunk.preview
+            || !voice_gate
+                .passes(&chunk.samples, meeting_id, &device_name, &device_type)
+                .await
         {
             continue;
         }
@@ -541,12 +604,74 @@ async fn transcribe_loop(
             &device_name,
             &device_type,
             model.clone(),
-            &mut sequence,
             speaker_vad.as_ref(),
         )
         .await?;
     }
     Ok(())
+}
+
+/// The id of a cut's line. Fixed by where the cut starts, so the previews of an
+/// unfinished cut and the finished cut itself are one line that gets replaced.
+fn live_item_id(stream_id: &str, device_type: &str, captured_at_unix_ms: u64) -> String {
+    format!(
+        "selected-engine:{}:{}:{}",
+        stream_id, device_type, captured_at_unix_ms
+    )
+}
+
+/// Transcribe what there is of an unfinished cut and show it as a provisional
+/// line: a delta only, never stored, with no voice match. Anything that goes
+/// wrong is dropped; the finished cut is what counts. A cut another microphone
+/// hears louder gets no previews, so the quieter copy of a sentence never
+/// flickers on screen before it is recognised as a copy.
+#[allow(clippy::too_many_arguments)]
+async fn show_preview(
+    chunk: LiveChunk,
+    voice_gate: &VoiceGate,
+    session: &mut TranscriptionSession,
+    config: &MeetingStreamingConfig,
+    meeting_id: i64,
+    stream_id: &str,
+    device_name: &str,
+    device_type: &str,
+    model: Option<String>,
+) {
+    if !voice_gate.hears_speech(&chunk.samples).await {
+        return;
+    }
+    let end_ms = chunk.captured_at_unix_ms
+        + (chunk.samples.len() as u64 * 1000) / LIVE_SAMPLE_RATE as u64;
+    if device_type == "input"
+        && louder_mic(meeting_id, device_name, chunk.captured_at_unix_ms, end_ms).is_some()
+    {
+        return;
+    }
+    let Ok(text) = session
+        .transcribe(&chunk.samples, LIVE_SAMPLE_RATE, device_name)
+        .await
+    else {
+        return;
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let _ = screenpipe_events::send_event(
+        "meeting_transcript_delta",
+        MeetingTranscriptDelta {
+            meeting_id,
+            provider: config.provider.as_str().to_string(),
+            model,
+            stream_id: stream_id.to_string(),
+            item_id: live_item_id(stream_id, device_type, chunk.captured_at_unix_ms),
+            device_name: device_name.to_string(),
+            device_type: device_type.to_string(),
+            delta: text.to_string(),
+            replace: true,
+            captured_at: captured_at_from_ms(chunk.captured_at_unix_ms),
+        },
+    );
 }
 
 async fn selected_engine_session(
@@ -621,7 +746,6 @@ async fn transcribe_chunk(
     device_name: &str,
     device_type: &str,
     model: Option<String>,
-    sequence: &mut u64,
     speaker_vad: Option<&super::live_speaker::LiveVad>,
 ) -> Result<()> {
     let transcript = session
@@ -633,11 +757,7 @@ async fn transcribe_chunk(
         return Ok(());
     }
 
-    *sequence += 1;
-    let item_id = format!(
-        "selected-engine:{}:{}:{}:{}",
-        stream_id, device_type, chunk.captured_at_unix_ms, sequence
-    );
+    let item_id = live_item_id(stream_id, device_type, chunk.captured_at_unix_ms);
     let captured_at = captured_at_from_ms(chunk.captured_at_unix_ms);
     // Who is speaking, by voice. A named match replaces the device-based
     // label; an unnamed one keeps it and is announced by id alone.
@@ -818,6 +938,21 @@ impl LiveChunkBuffer {
         Some(LiveChunk {
             samples,
             captured_at_unix_ms,
+            preview: false,
+        })
+    }
+
+    /// A copy of the cut so far, for a provisional line. `None` while it is
+    /// empty or digitally silent.
+    fn preview(&self) -> Option<LiveChunk> {
+        let captured_at_unix_ms = self.first_captured_at_unix_ms?;
+        if rms(&self.samples) < MIN_LIVE_RMS {
+            return None;
+        }
+        Some(LiveChunk {
+            samples: self.samples.clone(),
+            captured_at_unix_ms,
+            preview: true,
         })
     }
 }
@@ -825,6 +960,8 @@ impl LiveChunkBuffer {
 struct LiveChunk {
     samples: Vec<f32>,
     captured_at_unix_ms: u64,
+    /// The cut is still growing: show its text, store nothing.
+    preview: bool,
 }
 
 fn normalize_frame(
@@ -933,6 +1070,50 @@ mod tests {
     }
 
     #[test]
+    fn a_preview_is_due_each_second_the_cut_grows() {
+        let second = LIVE_SAMPLE_RATE as usize;
+        assert!(!preview_due(second - 1, 0));
+        assert!(preview_due(second, 0));
+        assert!(!preview_due(second + second / 2, second));
+        assert!(preview_due(2 * second, second));
+    }
+
+    #[test]
+    fn a_preview_never_displaces_a_waiting_cut_or_a_busy_transcriber() {
+        let chunk = |preview| LiveChunk {
+            samples: vec![0.1; 16],
+            captured_at_unix_ms: 1,
+            preview,
+        };
+        let mailbox = ChunkMailbox::default();
+        assert!(mailbox.put_preview(chunk(true)));
+        // A finished cut replaces a waiting preview...
+        mailbox.put(chunk(false));
+        // ...and a later preview does not replace it.
+        assert!(!mailbox.put_preview(chunk(true)));
+        assert!(!mailbox.take().unwrap().preview);
+
+        mailbox.busy.store(true, Ordering::SeqCst);
+        assert!(!mailbox.put_preview(chunk(true)));
+        assert!(mailbox.take().is_none());
+    }
+
+    #[test]
+    fn previews_and_the_finished_cut_share_one_line_id() {
+        let mut buffer = LiveChunkBuffer::default();
+        buffer.push(vec![0.1; LIVE_SAMPLE_RATE as usize], 7_000);
+        let preview = buffer.preview().unwrap();
+        buffer.push(vec![0.1; LIVE_SAMPLE_RATE as usize], 8_000);
+        let cut = buffer.take().unwrap();
+        assert!(preview.preview && !cut.preview);
+        assert_eq!(
+            live_item_id("s", "input", preview.captured_at_unix_ms),
+            live_item_id("s", "input", cut.captured_at_unix_ms)
+        );
+        assert!(LiveChunkBuffer::default().preview().is_none());
+    }
+
+    #[test]
     fn auto_is_no_language_hint_and_not_an_error() {
         assert!(forced_language(Some("auto")).is_none());
         assert!(forced_language(Some(" zh ")).is_some());
@@ -1033,10 +1214,12 @@ mod tests {
         mailbox.put(LiveChunk {
             samples: vec![0.1; 10],
             captured_at_unix_ms: 1,
+            preview: false,
         });
         mailbox.put(LiveChunk {
             samples: vec![0.2; 20],
             captured_at_unix_ms: 2,
+            preview: false,
         });
 
         let chunk = mailbox.take().expect("chunk");
