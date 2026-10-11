@@ -452,9 +452,15 @@ async fn next_file_head(state: &AppState, chunk: &AudioChunkInfo, device_name: &
     }
 }
 
-/// The stored speaker a voice matches, without creating or updating one.
-async fn known_speaker(state: &AppState, embedding: &[f32]) -> Option<i64> {
-    if embedding.is_empty() {
+/// A piece of speech shorter than this says nothing reliable about who is
+/// speaking: the half-second scrap at the end of a file matched a different
+/// stored speaker than the rest of its own sentence.
+const MIN_SPEAKER_SECS: f64 = 2.0;
+
+/// The stored speaker a piece of speech matches, without creating or updating
+/// one. `None` for a piece too short to tell.
+async fn known_speaker(state: &AppState, embedding: &[f32], secs: f64) -> Option<i64> {
+    if embedding.is_empty() || secs < MIN_SPEAKER_SECS {
         return None;
     }
     match state.db.match_speaker_from_embedding(embedding).await {
@@ -568,15 +574,17 @@ async fn transcribe_speaker_segments(
                     });
                 if let Some(rest) = rest {
                     let (mine, theirs) = (
-                        known_speaker(state, &segment.embedding).await,
-                        known_speaker(state, &rest.embedding).await,
+                        known_speaker(state, &segment.embedding, segment.end - segment.start)
+                            .await,
+                        known_speaker(state, &rest.embedding, rest.end - rest.start).await,
                     );
                     if mine.is_none() || theirs.is_none() || mine == theirs {
-                        segment.samples.extend_from_slice(&rest.samples);
-                        segment.end = chunk_secs + rest.end;
-                        if segment.embedding.is_empty() {
+                        // The longer piece says who is speaking.
+                        if rest.end - rest.start > segment.end - segment.start {
                             segment.embedding = rest.embedding;
                         }
+                        segment.samples.extend_from_slice(&rest.samples);
+                        segment.end = chunk_secs + rest.end;
                     }
                 }
             }
