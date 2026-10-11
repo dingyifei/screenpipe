@@ -174,7 +174,7 @@ fn forget_mic(meeting_id: i64, device_name: &str) {
     }
 }
 
-/// Feeds one input device's loudness into [`mics`] as its audio arrives.
+/// Feeds one device's loudness into [`mics`] as its audio arrives.
 struct MicLevels {
     meeting_id: i64,
     device_name: String,
@@ -293,7 +293,10 @@ async fn run_stream(
         tracker.clone(),
     ));
 
-    let mic_levels = (device_type == "input").then(|| MicLevels {
+    // The system audio is followed like a microphone: on loudspeakers the
+    // microphone hears the other side too, and its copy of a sentence is
+    // recognised against this one the way a second mic's is.
+    let mic_levels = Some(MicLevels {
         meeting_id,
         device_name: device_name.clone(),
         carry: Vec::new(),
@@ -546,11 +549,19 @@ impl VoiceGate {
         Some(crate::vad::speech_ratio(samples_16k, vad, self.is_output_device).await)
     }
 
+    /// The tracker's count passes a chunk of system audio only. On a
+    /// microphone it also hears the loudspeakers' sound from across the room,
+    /// which the detector rightly holds: passing that wrote every sentence of
+    /// the other side a second time.
+    fn voiced(&self, voiced_ms: u64) -> bool {
+        self.is_output_device && voiced_ms >= VOICED_PASS_MS
+    }
+
     /// `true` when a preview is worth transcribing. Not announced: the finished cut will be.
     async fn hears_speech(&self, samples_16k: &[f32], voiced_ms: u64) -> bool {
         match self.speech_ratio(samples_16k).await {
             Some(ratio) => {
-                ratio > crate::vad::asked_for_min_speech_ratio() || voiced_ms >= VOICED_PASS_MS
+                ratio > crate::vad::asked_for_min_speech_ratio() || self.voiced(voiced_ms)
             }
             None => true,
         }
@@ -575,7 +586,7 @@ impl VoiceGate {
             return true;
         };
         let min_speech_ratio = crate::vad::asked_for_min_speech_ratio();
-        let passed = speech_ratio > min_speech_ratio || voiced_ms >= VOICED_PASS_MS;
+        let passed = speech_ratio > min_speech_ratio || self.voiced(voiced_ms);
         let _ = screenpipe_events::send_event(
             "meeting_streaming_voice_gate",
             MeetingStreamingVoiceGate {
@@ -962,17 +973,15 @@ struct LiveLine {
 
 impl LiveLine {
     fn show(self) {
-        if self.final_event.device_type == "input" {
-            note_mic_line(
-                self.final_event.meeting_id,
-                &self.final_event.device_name,
-                MicLine {
-                    start_ms: self.span_ms.0,
-                    end_ms: self.span_ms.1,
-                    text: self.final_event.transcript.clone(),
-                },
-            );
-        }
+        note_mic_line(
+            self.final_event.meeting_id,
+            &self.final_event.device_name,
+            MicLine {
+                start_ms: self.span_ms.0,
+                end_ms: self.span_ms.1,
+                text: self.final_event.transcript.clone(),
+            },
+        );
         let _ = screenpipe_events::send_event("meeting_transcript_delta", self.delta);
         let _ = screenpipe_events::send_event("meeting_transcript_final", self.final_event);
         if let Some(track) = self.track {
@@ -1189,8 +1198,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn voice_gate_passes_what_the_tracker_heard_as_a_voice() {
-        let gate = VoiceGate::new(false).await;
+    async fn voice_gate_passes_what_the_tracker_heard_as_a_voice_on_system_audio() {
+        let mic = VoiceGate::new(false).await;
+        if mic.vad.is_some() {
+            let quiet = vec![0.0f32; LIVE_SAMPLE_RATE as usize * 2];
+            assert!(!mic.passes(&quiet, VOICED_PASS_MS, 1, "Mic", "input").await);
+        }
+        let gate = VoiceGate::new(true).await;
         if gate.vad.is_none() {
             return;
         }
