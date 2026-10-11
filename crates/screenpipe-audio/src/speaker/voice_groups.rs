@@ -76,9 +76,11 @@ pub fn group_voices(pieces: &[VoicePiece<'_>]) -> (Vec<VoiceGroup>, Vec<Option<u
 }
 
 /// [`group_voices`] for a file whose pieces were followed live: a piece with a
-/// track (`tracks[i]`) belongs to that track's group whatever its own sample
-/// says and however short it is, because the track was heard as one voice over
-/// far more than this piece. Pieces without a track are grouped by voice as
+/// track (`tracks[i]`) belongs to that track's group however short it is,
+/// because the track was heard as one voice over far more than this piece. A
+/// piece long enough to have a sample of its own must still sound like the
+/// track ([`SAME_VOICE_MAX_DISTANCE`]); otherwise it is grouped by voice, so
+/// two voices on one track never pool into one stored speaker. Pieces without a track are grouped by voice as
 /// before, and may join a track's group. Also returns each group's track.
 pub fn group_voices_by_track(
     pieces: &[VoicePiece<'_>],
@@ -109,7 +111,20 @@ pub fn group_voices_by_track(
             continue;
         }
         let weight = secs(piece) as f32 / norm;
-        let known = match track_of(i) {
+        // A track vouches for a piece only while the piece sounds like the
+        // track: the diarizer's channels sometimes hold two voices, and the
+        // pooled sample of a group trains a stored speaker. A full-length piece
+        // that does not sound like its track is grouped by its own voice.
+        let on_track = track_of(i).filter(|track| {
+            group_track
+                .iter()
+                .position(|t| t.as_deref() == Some(*track))
+                .is_none_or(|group| {
+                    cosine_distance(&groups[group].embedding, piece.embedding)
+                        < SAME_VOICE_MAX_DISTANCE
+                })
+        });
+        let known = match on_track {
             Some(track) => group_track.iter().position(|t| t.as_deref() == Some(track)),
             None => nearest(&groups, piece.embedding)
                 .filter(|(_, distance)| *distance < SAME_VOICE_MAX_DISTANCE)
@@ -121,7 +136,7 @@ pub fn group_voices_by_track(
                 secs: 0.0,
             });
             sums.push(vec![0.0; piece.embedding.len()]);
-            group_track.push(track_of(i).map(str::to_string));
+            group_track.push(on_track.map(str::to_string));
             groups.len() - 1
         });
         for (sum, value) in sums[index].iter_mut().zip(piece.embedding) {
@@ -275,43 +290,45 @@ mod tests {
     }
 
     #[test]
-    fn a_track_is_one_group_whatever_its_pieces_sound_like() {
-        let (a, b) = (vec![1.0, 0.0], vec![0.0, 1.0]);
+    fn a_track_groups_its_pieces_but_not_a_different_voice() {
+        let (a, a2, b) = (vec![1.0, 0.0], vec![0.9, 0.3], vec![0.0, 1.0]);
         let pieces = [
             VoicePiece {
                 start: 0.0,
                 end: 3.0,
                 embedding: &a,
             },
-            // Same track, a sample that sounds nothing like it, and a scrap.
+            // Same track and the same voice a little off; then a scrap of it.
             VoicePiece {
                 start: 3.0,
                 end: 5.0,
-                embedding: &b,
+                embedding: &a2,
             },
             VoicePiece {
                 start: 5.0,
                 end: 5.4,
                 embedding: &b,
             },
-            // No track: joins by voice.
+            // Same track, a different voice: not pooled into the track's speaker.
             VoicePiece {
                 start: 6.0,
-                end: 8.0,
-                embedding: &a,
+                end: 8.5,
+                embedding: &b,
             },
+            // No track: joins by voice.
             VoicePiece {
                 start: 9.0,
-                end: 12.0,
-                embedding: &b,
+                end: 11.0,
+                embedding: &a,
             },
         ];
         let t = |s: &str| Some(s.to_string());
-        let tracks = [t("mic#1"), t("mic#1"), t("mic#1"), None, t("mic#2")];
+        let tracks = [t("mic#1"), t("mic#1"), t("mic#1"), t("mic#1"), None];
         let (groups, of, group_track) = group_voices_by_track(&pieces, &tracks);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(of, vec![Some(0), Some(0), Some(0), Some(0), Some(1)]);
-        assert_eq!(group_track, vec![t("mic#1"), t("mic#2")]);
+        assert_eq!(of, vec![Some(0), Some(0), Some(0), Some(1), Some(0)]);
+        assert_eq!(group_track, vec![t("mic#1"), None]);
         assert!((groups[0].secs - 7.0).abs() < 1e-6);
+        // The other voice left no trace in the track's sample.
+        assert!(cosine_distance(&groups[0].embedding, &a) < 0.05);
     }
 }
