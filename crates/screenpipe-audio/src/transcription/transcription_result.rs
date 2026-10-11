@@ -355,6 +355,18 @@ pub async fn get_or_create_speaker_from_embedding(
     embedding: &[f32],
     speech_duration_secs: f64,
 ) -> Result<Option<Speaker>, anyhow::Error> {
+    get_or_create_speaker_in_conversation(db, embedding, speech_duration_secs, &[]).await
+}
+
+/// [`get_or_create_speaker_from_embedding`] for one conversation: `recent` are
+/// the speakers already heard in it, matched at the looser limit
+/// (`match_speaker_from_embedding_recent`).
+pub async fn get_or_create_speaker_in_conversation(
+    db: &DatabaseManager,
+    embedding: &[f32],
+    speech_duration_secs: f64,
+    recent: &[i64],
+) -> Result<Option<Speaker>, anyhow::Error> {
     let decision = speaker_identify_decision(speech_duration_secs);
     if decision == SpeakerIdentifyDecision::Skip {
         debug!(
@@ -364,7 +376,9 @@ pub async fn get_or_create_speaker_from_embedding(
         return Ok(None);
     }
 
-    let speaker_match = db.match_speaker_from_embedding(embedding).await?;
+    let speaker_match = db
+        .match_speaker_from_embedding_recent(embedding, recent)
+        .await?;
     if let SpeakerEmbeddingMatch::Matched(speaker) = speaker_match {
         debug!(
             "matched speaker id={} name={:?} decision={}",

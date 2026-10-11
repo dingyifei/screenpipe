@@ -166,6 +166,9 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Longest stretch [`AudioManager::voice_embedding`] reads.
+const VOICE_SAMPLE_MAX_SECS: usize = 20;
+
 #[derive(Clone)]
 pub struct AudioManager {
     /// Liveness token for `Drop`. Every field below is shared (`Arc`), so a
@@ -2224,6 +2227,30 @@ impl AudioManager {
     /// Returns the user override for OpenAI-compatible batch duration.
     pub async fn batch_max_duration_secs(&self) -> Option<u64> {
         self.options.read().await.batch_max_duration_secs
+    }
+
+    /// One voice sample for a stretch of speech (16 kHz mono), taken over all
+    /// of it up to [`VOICE_SAMPLE_MAX_SECS`]. The diarizer's own sample for a
+    /// segment covers its first two seconds only, which is too little to tell
+    /// two sentences of one person from two people. `None` when the model is
+    /// not loaded or the audio is too short for it.
+    pub async fn voice_embedding(&self, samples_16k: &[f32]) -> Option<Vec<f32>> {
+        let extractor = self
+            .segmentation_manager
+            .embedding_extractor
+            .lock()
+            .await
+            .clone()?;
+        let samples = samples_16k[..samples_16k.len().min(VOICE_SAMPLE_MAX_SECS * 16000)].to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut extractor = extractor.lock().ok()?;
+            let embedding: Vec<f32> = extractor.compute(&samples).ok()?.collect();
+            Some(embedding)
+                .filter(|e| e.iter().any(|v| *v != 0.0) && e.iter().all(|v| v.is_finite()))
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// A voice-activity detector of the configured kind that shares no state

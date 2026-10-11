@@ -1979,6 +1979,148 @@ mod tests {
         assert_eq!(speakers[0].name, "speaker 1");
     }
 
+    // A 512-wide voice at an angle in the plane of the first two axes: the
+    // cosine distance between two of them is 1 - cos(the difference).
+    fn voice_at(degrees: f32) -> Vec<f32> {
+        let mut v = vec![0.0; 512];
+        v[0] = degrees.to_radians().cos();
+        v[1] = degrees.to_radians().sin();
+        v
+    }
+
+    async fn sample_count(db: &DatabaseManager, speaker_id: i64) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?1")
+            .bind(speaker_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_speaker_already_heard_is_matched_at_the_looser_limit() {
+        let db = setup_test_db().await;
+        let narrator = db.insert_speaker(&voice_at(0.0)).await.unwrap();
+        // 66 degrees away is a distance of about 0.59: past the general limit
+        // (0.55), inside the one for a voice of the same conversation (0.62).
+        let later = voice_at(66.0);
+        assert!(matches!(
+            db.match_speaker_from_embedding(&later).await.unwrap(),
+            screenpipe_db::SpeakerEmbeddingMatch::NoMatch
+        ));
+        match db
+            .match_speaker_from_embedding_recent(&later, &[narrator.id])
+            .await
+            .unwrap()
+        {
+            screenpipe_db::SpeakerEmbeddingMatch::Matched(speaker) => {
+                assert_eq!(speaker.id, narrator.id)
+            }
+            other => panic!("expected the narrator, got {other:?}"),
+        }
+        // Listing somebody else does not loosen it.
+        assert!(matches!(
+            db.match_speaker_from_embedding_recent(&later, &[narrator.id + 100])
+                .await
+                .unwrap(),
+            screenpipe_db::SpeakerEmbeddingMatch::NoMatch
+        ));
+        // And a different voice (90 degrees, distance 1.0) stays unmatched.
+        assert!(matches!(
+            db.match_speaker_from_embedding_recent(&voice_at(90.0), &[narrator.id])
+                .await
+                .unwrap(),
+            screenpipe_db::SpeakerEmbeddingMatch::NoMatch
+        ));
+    }
+
+    #[tokio::test]
+    async fn merging_moves_only_the_samples_that_sound_like_the_kept_voice() {
+        let db = setup_test_db().await;
+        let me = db.insert_speaker(&voice_at(0.0)).await.unwrap();
+        db.update_speaker_name(me.id, "Me").await.unwrap();
+        // Another speaker holding one sample close to Me and one of a stranger.
+        let other = db.insert_speaker(&voice_at(30.0)).await.unwrap();
+        db.add_embedding_to_speaker(other.id, &voice_at(120.0), 10)
+            .await
+            .unwrap();
+
+        let (moved, dropped) = db
+            .merge_speakers_keeping_voice(me.id, other.id)
+            .await
+            .unwrap();
+        assert_eq!((moved, dropped), (1, 1));
+        assert_eq!(sample_count(&db, me.id).await, 2);
+        // The stranger's voice did not become Me.
+        assert!(matches!(
+            db.match_speaker_from_embedding(&voice_at(120.0))
+                .await
+                .unwrap(),
+            screenpipe_db::SpeakerEmbeddingMatch::NoMatch
+        ));
+        // The merged speaker is gone.
+        assert!(db.get_speaker_by_id(other.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn merging_never_takes_a_speaker_past_its_sample_cap() {
+        let db = setup_test_db().await;
+        let kept = db.insert_speaker(&voice_at(0.0)).await.unwrap();
+        for i in 1..10 {
+            db.add_embedding_to_speaker(kept.id, &voice_at(i as f32), 10)
+                .await
+                .unwrap();
+        }
+        let other = db.insert_speaker(&voice_at(20.0)).await.unwrap();
+        let (moved, dropped) = db
+            .merge_speakers_keeping_voice(kept.id, other.id)
+            .await
+            .unwrap();
+        assert_eq!((moved, dropped), (0, 1));
+        assert_eq!(sample_count(&db, kept.id).await, 10);
+    }
+
+    #[tokio::test]
+    async fn a_speaker_without_a_voice_takes_the_merged_one() {
+        let db = setup_test_db().await;
+        let kept = db.insert_speaker(&voice_at(0.0)).await.unwrap();
+        sqlx::query("DELETE FROM speaker_embeddings WHERE speaker_id = ?1")
+            .bind(kept.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let other = db.insert_speaker(&voice_at(120.0)).await.unwrap();
+        let (moved, dropped) = db
+            .merge_speakers_keeping_voice(kept.id, other.id)
+            .await
+            .unwrap();
+        assert_eq!((moved, dropped), (1, 0));
+        assert_eq!(sample_count(&db, kept.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn teaching_a_voice_replaces_what_was_stored() {
+        let db = setup_test_db().await;
+        let me = db.insert_speaker(&voice_at(120.0)).await.unwrap();
+        db.update_speaker_name(me.id, "Me").await.unwrap();
+        db.replace_speaker_embeddings(me.id, &[voice_at(0.0), voice_at(10.0)])
+            .await
+            .unwrap();
+        assert_eq!(sample_count(&db, me.id).await, 2);
+        // The old voice no longer matches; the taught one does.
+        assert!(matches!(
+            db.match_speaker_from_embedding(&voice_at(120.0))
+                .await
+                .unwrap(),
+            screenpipe_db::SpeakerEmbeddingMatch::NoMatch
+        ));
+        assert!(matches!(
+            db.match_speaker_from_embedding(&voice_at(5.0))
+                .await
+                .unwrap(),
+            screenpipe_db::SpeakerEmbeddingMatch::Matched(_)
+        ));
+    }
+
     #[tokio::test]
     async fn test_search_speakers() {
         let db = setup_test_db().await;

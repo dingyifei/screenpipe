@@ -460,16 +460,191 @@ pub(crate) async fn merge_speakers_handler(
 
     state
         .db
-        .merge_speakers(speaker_to_keep_id, speaker_to_merge_id)
+        .merge_speakers_keeping_voice(speaker_to_keep_id, speaker_to_merge_id)
         .await
+        .map(|(samples_moved, samples_dropped)| {
+            JsonResponse(json!({
+                "success": true,
+                "samples_moved": samples_moved,
+                "samples_dropped": samples_dropped,
+            }))
+        })
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 JsonResponse(json!({"error": e.to_string(), "speaker_to_keep_id": speaker_to_keep_id, "speaker_to_merge_id": speaker_to_merge_id})),
             )
-        })?;
+        })
+}
 
-    Ok(JsonResponse(json!({"success": true})))
+#[derive(OaSchema, Deserialize, Debug)]
+pub(crate) struct TeachSpeakerRequest {
+    id: i64,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+}
+
+/// The least speech of one voice a speaker can be taught from.
+const TEACH_MIN_SECS: f64 = 8.0;
+/// A second voice with this share of the main one's speech means the
+/// recording is not one person talking.
+const TEACH_SECOND_VOICE_SHARE: f64 = 0.3;
+/// The longest stretch of recording a teaching request may name.
+const TEACH_MAX_RANGE_SECS: i64 = 180;
+
+fn teach_error(status: StatusCode, message: &str) -> (StatusCode, JsonResponse<Value>) {
+    (status, JsonResponse(json!({ "error": message })))
+}
+
+/// Teach a speaker their voice again from what one microphone recorded
+/// between `start` and `end`, while that person alone was talking: the
+/// speaker's stored samples are **replaced** by samples of that speech. For a
+/// profile that has gone wrong (other voices merged into it), which no amount
+/// of further matching repairs.
+///
+/// The recording is the recorder's own; nothing is uploaded. With several
+/// microphones the one that heard the most of the voice is used. Refused when
+/// there is too little speech or a second voice takes a real share of it.
+#[oasgen]
+pub(crate) async fn teach_speaker_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TeachSpeakerRequest>,
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
+    use screenpipe_audio::speaker::voice_groups::{group_voices, VoicePiece, GROUP_SEED_SECS};
+
+    let span = (request.end - request.start).num_seconds();
+    if span <= 0 || span > TEACH_MAX_RANGE_SECS {
+        return Err(teach_error(
+            StatusCode::BAD_REQUEST,
+            "start and end must name up to three minutes of recording",
+        ));
+    }
+    state
+        .db
+        .get_speaker_by_id(request.id)
+        .await
+        .map_err(|_| teach_error(StatusCode::NOT_FOUND, "no such speaker"))?;
+    // A file holds about thirty seconds from its timestamp on.
+    let chunks = state
+        .db
+        .get_audio_chunks_in_range(request.start - chrono::Duration::seconds(35), request.end)
+        .await
+        .map_err(|e| teach_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    // Per microphone: every piece of speech in the range, with its voice sample.
+    let mut by_device: std::collections::BTreeMap<String, Vec<(f64, f64, Vec<f32>)>> =
+        Default::default();
+    let mut seen = std::collections::HashSet::new();
+    for chunk in &chunks {
+        let device = super::retranscribe::retranscribe_chunk_device(chunk);
+        if !device.is_input || !seen.insert(chunk.id) {
+            continue;
+        }
+        let Ok((samples, sample_rate)) =
+            screenpipe_audio::utils::ffmpeg::read_audio_from_file(Path::new(&chunk.file_path))
+        else {
+            continue;
+        };
+        let Ok(samples) = (if sample_rate == 16000 {
+            Ok(samples)
+        } else {
+            screenpipe_audio::resample(&samples, sample_rate, 16000)
+        }) else {
+            continue;
+        };
+        let vad = state.audio_manager.detached_vad().await;
+        let Ok(segments) = state
+            .audio_manager
+            .speech_segments(&samples, vad, &device.name, false)
+            .await
+        else {
+            continue;
+        };
+        // Seconds from the start of the range, so pieces of consecutive files line up.
+        let offset = (chunk.timestamp - request.start).num_milliseconds() as f64 / 1000.0;
+        for segment in segments {
+            let (start, end) = (offset + segment.start, offset + segment.end);
+            if end <= 0.0 || start >= span as f64 || segment.sample_rate != 16000 {
+                continue;
+            }
+            if let Some(voice) = state.audio_manager.voice_embedding(&segment.samples).await {
+                by_device
+                    .entry(device.name.clone())
+                    .or_default()
+                    .push((start, end, voice));
+            }
+        }
+    }
+
+    // The microphone whose main voice has the most speech.
+    let mut best: Option<(f64, f64, Vec<Vec<f32>>)> = None;
+    for pieces in by_device.values() {
+        let view: Vec<VoicePiece<'_>> = pieces
+            .iter()
+            .map(|(start, end, voice)| VoicePiece {
+                start: *start,
+                end: *end,
+                embedding: voice,
+            })
+            .collect();
+        let (groups, of) = group_voices(&view);
+        let Some((main, group)) = groups
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.secs.total_cmp(&b.1.secs))
+        else {
+            continue;
+        };
+        let second = groups
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != main)
+            .map(|(_, g)| g.secs)
+            .fold(0.0, f64::max);
+        // The samples to keep: the main voice's full-length pieces, longest first.
+        let mut members: Vec<&(f64, f64, Vec<f32>)> = pieces
+            .iter()
+            .zip(&of)
+            .filter(|(piece, group)| **group == Some(main) && piece.1 - piece.0 >= GROUP_SEED_SECS)
+            .map(|(piece, _)| piece)
+            .collect();
+        members.sort_by(|a, b| (b.1 - b.0).total_cmp(&(a.1 - a.0)));
+        if best.as_ref().is_none_or(|b| group.secs > b.0) {
+            best = Some((
+                group.secs,
+                second,
+                members.into_iter().map(|m| m.2.clone()).collect(),
+            ));
+        }
+    }
+    let Some((secs, second, samples)) = best else {
+        return Err(teach_error(
+            StatusCode::BAD_REQUEST,
+            "no speech was recorded on a microphone in that time",
+        ));
+    };
+    if secs < TEACH_MIN_SECS {
+        return Err(teach_error(
+            StatusCode::BAD_REQUEST,
+            &format!("only {secs:.0} seconds of speech were heard; speak for longer"),
+        ));
+    }
+    if second >= secs * TEACH_SECOND_VOICE_SHARE {
+        return Err(teach_error(
+            StatusCode::BAD_REQUEST,
+            "more than one voice was heard; try again with only one person speaking",
+        ));
+    }
+    state
+        .db
+        .replace_speaker_embeddings(request.id, &samples)
+        .await
+        .map_err(|e| teach_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(JsonResponse(json!({
+        "success": true,
+        "seconds": secs,
+        "samples": samples.len().min(screenpipe_db::SPEAKER_MAX_STORED_EMBEDDINGS),
+    })))
 }
 
 #[oasgen]

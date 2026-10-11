@@ -32,16 +32,41 @@ const SPEAKER_REF_TABLES: [&str; 5] = [
 /// embedding close to two profiles does not arbitrarily mutate either one.
 const SPEAKER_MATCH_MAX_DISTANCE: f32 = 0.55;
 const SPEAKER_MATCH_MIN_MARGIN: f32 = 0.08;
+/// The limit for a voice already heard in the conversation being processed,
+/// and for samples a merge may carry over. One voice measured up to 0.6 from
+/// its own earlier sentences and different voices 0.7 and up, on whole
+/// sentences; the general limit above cuts one narrator into several speakers.
+pub const SPEAKER_MATCH_RECENT_MAX_DISTANCE: f32 = 0.62;
+/// How many voice samples a speaker keeps.
+pub const SPEAKER_MAX_STORED_EMBEDDINGS: usize = 10;
 
 type SpeakerMatchCandidate = (i64, String, String, f32);
 
 fn classify_speaker_candidates(candidates: Vec<SpeakerMatchCandidate>) -> SpeakerEmbeddingMatch {
+    classify_speaker_candidates_recent(candidates, &[])
+}
+
+/// [`classify_speaker_candidates`] with the looser limit for the speakers in
+/// `recent`. Candidates past their own limit are not candidates at all, so one
+/// of them cannot make a real match ambiguous either.
+fn classify_speaker_candidates_recent(
+    candidates: Vec<SpeakerMatchCandidate>,
+    recent: &[i64],
+) -> SpeakerEmbeddingMatch {
+    let candidates: Vec<SpeakerMatchCandidate> = candidates
+        .into_iter()
+        .filter(|(id, _, _, distance)| {
+            let limit = if recent.contains(id) {
+                SPEAKER_MATCH_RECENT_MAX_DISTANCE
+            } else {
+                SPEAKER_MATCH_MAX_DISTANCE
+            };
+            *distance < limit
+        })
+        .collect();
     let Some((id, name, metadata, best_distance)) = candidates.first().cloned() else {
         return SpeakerEmbeddingMatch::NoMatch;
     };
-    if best_distance >= SPEAKER_MATCH_MAX_DISTANCE {
-        return SpeakerEmbeddingMatch::NoMatch;
-    }
     let best = Speaker { id, name, metadata };
 
     if let Some((_, _, _, runner_up_distance)) = candidates.get(1) {
@@ -227,32 +252,64 @@ impl DatabaseManager {
         embedding: &[f32],
         day: &str,
     ) -> Result<SpeakerEmbeddingMatch, SqlxError> {
+        self.match_speaker_from_embedding_recent_on(embedding, &[], day)
+            .await
+    }
+
+    /// [`Self::match_speaker_from_embedding`] for a conversation: the speakers
+    /// in `recent` were already heard in it, and are matched at
+    /// [`SPEAKER_MATCH_RECENT_MAX_DISTANCE`].
+    pub async fn match_speaker_from_embedding_recent(
+        &self,
+        embedding: &[f32],
+        recent: &[i64],
+    ) -> Result<SpeakerEmbeddingMatch, SqlxError> {
+        self.match_speaker_from_embedding_recent_on(embedding, recent, &speaker_day_today())
+            .await
+    }
+
+    async fn match_speaker_from_embedding_recent_on(
+        &self,
+        embedding: &[f32],
+        recent: &[i64],
+        day: &str,
+    ) -> Result<SpeakerEmbeddingMatch, SqlxError> {
         let bytes: &[u8] = embedding.as_bytes();
+        // Ids come from the caller as integers; they are formatted, not bound,
+        // because the list has no fixed length.
+        let recent_list = recent
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
 
         // Use the best stored sample per distinct speaker. Without grouping, a
         // speaker's ten stored embeddings can occupy both result slots and hide
         // a genuinely close runner-up profile.
-        let candidates: Vec<SpeakerMatchCandidate> = sqlx::query_as(
+        // A few more than two: a candidate inside the general limit can sit
+        // behind recent ones that are only inside the looser limit.
+        let candidates: Vec<SpeakerMatchCandidate> = sqlx::query_as(AssertSqlSafe(format!(
             "WITH candidates AS (
-                 SELECT s.id, s.name, s.metadata,
+                 SELECT s.id, COALESCE(s.name, '') AS name, COALESCE(s.metadata, '') AS metadata,
                         MIN(vec_distance_cosine(se.embedding, vec_f32(?1))) AS distance
                  FROM speaker_embeddings se
                  JOIN speakers s ON s.id = se.speaker_id
                  WHERE COALESCE(s.name, '') != ''
                     OR (json_valid(s.metadata) AND json_extract(s.metadata, '$.day') = ?2)
+                    OR s.id IN ({recent_list})
                  GROUP BY s.id, s.name, s.metadata
              )
              SELECT id, name, metadata, distance
              FROM candidates
              ORDER BY distance, id
-             LIMIT 2",
-        )
+             LIMIT 6"
+        )))
         .bind(bytes)
         .bind(day)
         .fetch_all(&self.pool)
         .await?;
 
-        let stored_match = classify_speaker_candidates(candidates);
+        let stored_match = classify_speaker_candidates_recent(candidates, recent);
         if !matches!(stored_match, SpeakerEmbeddingMatch::NoMatch) {
             return Ok(stored_match);
         }
@@ -689,17 +746,146 @@ impl DatabaseManager {
         speaker_to_keep_id: i64,
         speaker_to_merge_id: i64,
     ) -> Result<Speaker, sqlx::Error> {
+        self.merge_speakers_keeping_voice(speaker_to_keep_id, speaker_to_merge_id)
+            .await?;
+        self.get_speaker_by_id(speaker_to_keep_id).await
+    }
+
+    /// Merge one speaker into another. The lines always move. The merged
+    /// speaker's voice samples move only where they sound like the kept voice
+    /// (within [`SPEAKER_MATCH_RECENT_MAX_DISTANCE`] of one of its samples) and
+    /// only up to the kept speaker's cap; the rest are deleted. Moving them
+    /// all, as this used to, turned a named speaker into a bag of every voice
+    /// ever merged into it, which then matched everybody. A kept speaker with
+    /// no samples takes the merged one's as they are.
+    ///
+    /// Returns `(samples_moved, samples_dropped)`.
+    pub async fn merge_speakers_keeping_voice(
+        &self,
+        speaker_to_keep_id: i64,
+        speaker_to_merge_id: i64,
+    ) -> Result<(u64, u64), sqlx::Error> {
         let mut tx = self.begin_immediate_with_retry().await?;
 
-        // Move every reference — meeting segments and diarization rows too,
-        // not just transcriptions and embeddings — then retire the row only
-        // once nothing points at it.
+        let kept: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?1")
+                .bind(speaker_to_keep_id)
+                .fetch_one(&mut **tx.conn())
+                .await?;
+        let offered: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?1")
+                .bind(speaker_to_merge_id)
+                .fetch_one(&mut **tx.conn())
+                .await?;
+        let room = (SPEAKER_MAX_STORED_EMBEDDINGS as i64 - kept).max(0);
+        // The samples that may come along, closest first.
+        let alike: Vec<(i64,)> = if kept == 0 {
+            sqlx::query_as(
+                "SELECT id FROM speaker_embeddings WHERE speaker_id = ?1 ORDER BY id LIMIT ?2",
+            )
+            .bind(speaker_to_merge_id)
+            .bind(room)
+            .fetch_all(&mut **tx.conn())
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT m.id
+                 FROM speaker_embeddings m
+                 JOIN speaker_embeddings k ON k.speaker_id = ?2
+                 WHERE m.speaker_id = ?1
+                 GROUP BY m.id
+                 HAVING MIN(vec_distance_cosine(m.embedding, k.embedding)) < ?3
+                 ORDER BY MIN(vec_distance_cosine(m.embedding, k.embedding))
+                 LIMIT ?4",
+            )
+            .bind(speaker_to_merge_id)
+            .bind(speaker_to_keep_id)
+            .bind(SPEAKER_MATCH_RECENT_MAX_DISTANCE)
+            .bind(room)
+            .fetch_all(&mut **tx.conn())
+            .await?
+        };
+        for (id,) in &alike {
+            sqlx::query("UPDATE speaker_embeddings SET speaker_id = ?1 WHERE id = ?2")
+                .bind(speaker_to_keep_id)
+                .bind(id)
+                .execute(&mut **tx.conn())
+                .await?;
+        }
+        sqlx::query("DELETE FROM speaker_embeddings WHERE speaker_id = ?1")
+            .bind(speaker_to_merge_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        if kept == 0 && !alike.is_empty() {
+            // The kept speaker had no voice of its own: it takes the merged one's centre too.
+            sqlx::query(
+                "UPDATE speakers SET
+                     centroid = (SELECT centroid FROM speakers WHERE id = ?2),
+                     embedding_count = (SELECT embedding_count FROM speakers WHERE id = ?2)
+                 WHERE id = ?1",
+            )
+            .bind(speaker_to_keep_id)
+            .bind(speaker_to_merge_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        }
+
+        // Move every other reference — meeting segments and diarization rows
+        // too, not just transcriptions — then retire the row only once nothing
+        // points at it.
         repoint_speaker_refs(tx.conn(), speaker_to_merge_id, speaker_to_keep_id).await?;
         delete_speaker_if_unreferenced(tx.conn(), speaker_to_merge_id).await?;
 
         tx.commit().await?;
 
-        self.get_speaker_by_id(speaker_to_keep_id).await
+        let moved = alike.len() as u64;
+        Ok((moved, (offered as u64).saturating_sub(moved)))
+    }
+
+    /// Replace a speaker's stored voice: its samples become `embeddings` (the
+    /// first [`SPEAKER_MAX_STORED_EMBEDDINGS`] of them) and its centre their
+    /// mean. For a profile that has to be taught again from known speech.
+    pub async fn replace_speaker_embeddings(
+        &self,
+        speaker_id: i64,
+        embeddings: &[Vec<f32>],
+    ) -> Result<(), sqlx::Error> {
+        let embeddings = &embeddings[..embeddings.len().min(SPEAKER_MAX_STORED_EMBEDDINGS)];
+        let Some(first) = embeddings.first() else {
+            return Ok(());
+        };
+        let mut centroid = vec![0f32; first.len()];
+        for embedding in embeddings {
+            for (sum, value) in centroid.iter_mut().zip(embedding) {
+                *sum += value / embeddings.len() as f32;
+            }
+        }
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query("DELETE FROM speaker_embeddings WHERE speaker_id = ?1")
+            .bind(speaker_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        for embedding in embeddings {
+            let bytes: &[u8] = embedding.as_bytes();
+            sqlx::query(
+                "INSERT INTO speaker_embeddings (embedding, speaker_id) VALUES (vec_f32(?1), ?2)",
+            )
+            .bind(bytes)
+            .bind(speaker_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        }
+        let bytes: &[u8] = centroid.as_bytes();
+        sqlx::query(
+            "UPDATE speakers SET centroid = vec_f32(?1), embedding_count = ?2 WHERE id = ?3",
+        )
+        .bind(bytes)
+        .bind(embeddings.len() as i64)
+        .bind(speaker_id)
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn search_speakers(&self, name_prefix: &str) -> Result<Vec<Speaker>, sqlx::Error> {

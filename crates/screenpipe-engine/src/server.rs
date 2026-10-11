@@ -69,8 +69,8 @@ use crate::{
         speakers::{
             delete_speaker_handler, get_similar_speakers_handler, get_speaker_sample_handler,
             get_unnamed_speakers_handler, mark_as_hallucination_handler, merge_speakers_handler,
-            reassign_speaker_handler, search_speakers_handler, undo_speaker_reassign_handler,
-            update_speaker_handler,
+            reassign_speaker_handler, search_speakers_handler, teach_speaker_handler,
+            undo_speaker_reassign_handler, update_speaker_handler,
         },
         streaming::stream_frames_handler,
         websocket::{
@@ -930,6 +930,7 @@ impl SCServer {
             .post("/speakers/delete", delete_speaker_handler)
             .post("/speakers/hallucination", mark_as_hallucination_handler)
             .post("/speakers/merge", merge_speakers_handler)
+            .post("/speakers/teach", teach_speaker_handler)
             .get("/speakers/similar", get_similar_speakers_handler)
             .post("/speakers/reassign", reassign_speaker_handler)
             .post("/speakers/undo-reassign", undo_speaker_reassign_handler)

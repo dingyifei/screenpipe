@@ -52,7 +52,7 @@ pub use db::{
     SemanticActorAlias, SemanticActorReference, SemanticAttachResult, SemanticCleanupResult,
     SemanticContextQuery, SemanticFrameContext, SemanticProjectionWriteResult,
     MEETING_END_REASON_AUTO_END, MEETING_END_REASON_EXPLICIT_STOP, MEETING_END_REASON_ROOM_CHANGED,
-    MEETING_END_REASON_SHUTDOWN,
+    MEETING_END_REASON_SHUTDOWN, SPEAKER_MATCH_RECENT_MAX_DISTANCE, SPEAKER_MAX_STORED_EMBEDDINGS,
 };
 pub use recovery::{
     inspect_database_health, probe_quarantined_generation_health, rebuild_recovered_fts5_indexes,
