@@ -11,19 +11,18 @@
 //! stays within about 0.6 of its other sentences and different voices sit at
 //! 0.7 and beyond.
 
-/// A piece this long can found a voice group. Shorter ones only follow one.
-/// The diarizer cuts speech into two-second samples, so a piece of exactly
-/// two seconds is usually a scrap it split off a longer stretch; counted as a
-/// voice, those scraps founded a speaker that then drew in short pieces of
-/// everybody.
-pub const GROUP_SEED_SECS: f64 = 2.5;
-/// A short piece far from any speech in time joins a group only this close:
-/// short samples resemble each other more than they resemble their speaker.
-pub const SHORT_PIECE_MAX_DISTANCE: f32 = 0.5;
+/// A piece this long has a voice sample worth grouping. Shorter ones only
+/// follow the speech next to them.
+pub const GROUP_PIECE_SECS: f64 = 1.0;
+/// A group with this much speech is a voice that may become a speaker. The
+/// diarizer hands speech over in scraps of two seconds and less, so the bar is
+/// on the group, not on any one piece; but a lone scrap counted as a voice
+/// founded a speaker that then drew in short pieces of everybody.
+pub const GROUP_VOICE_SECS: f64 = 4.0;
 /// Two samples of one voice are within this cosine distance.
 pub const SAME_VOICE_MAX_DISTANCE: f32 = 0.6;
-/// A short piece with no voice of its own belongs to the speech this close to
-/// it in time.
+/// A piece with no speaker of its own belongs to the speech this close to it
+/// in time.
 pub const NEIGHBOUR_GAP_SECS: f64 = 1.5;
 
 /// One piece of speech: where it sits in the file and its voice sample
@@ -37,10 +36,9 @@ pub struct VoicePiece<'a> {
 /// One voice in a file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoiceGroup {
-    /// The founding pieces' samples, averaged by length and normalized.
+    /// Its pieces' samples, averaged by length and normalized.
     pub embedding: Vec<f32>,
-    /// Seconds of speech in the pieces that founded or joined it by voice at
-    /// full length; the short pieces that follow along are not counted.
+    /// Seconds of speech in its pieces.
     pub secs: f64,
 }
 
@@ -66,26 +64,23 @@ fn nearest(groups: &[VoiceGroup], embedding: &[f32]) -> Option<(usize, f32)> {
 }
 
 /// Group a file's pieces by voice. Returns the groups and, for each piece, the
-/// group it belongs to (`None`: nothing says whose it is).
+/// group it belongs to (`None` for a piece under [`GROUP_PIECE_SECS`] or
+/// without a sample).
 ///
-/// Pieces of [`GROUP_SEED_SECS`] or more are placed longest first: each joins
-/// the nearest group within [`SAME_VOICE_MAX_DISTANCE`] or founds one. A
-/// shorter piece goes with the placed piece next to it in time (the one
-/// before, else the one after, within [`NEIGHBOUR_GAP_SECS`]): it is far more
-/// often the same person carrying on than its own noisy sample suggests. With
-/// nobody next to it, it joins a group only when it sounds much like it
-/// ([`SHORT_PIECE_MAX_DISTANCE`]).
+/// Pieces are placed longest first: each joins the nearest group within
+/// [`SAME_VOICE_MAX_DISTANCE`] or founds one. What a group may do depends on
+/// its `secs`, which is the caller's call (see [`GROUP_VOICE_SECS`]).
 pub fn group_voices(pieces: &[VoicePiece<'_>]) -> (Vec<VoiceGroup>, Vec<Option<usize>>) {
     let secs = |p: &VoicePiece<'_>| (p.end - p.start).max(0.0);
     let mut groups: Vec<VoiceGroup> = Vec::new();
     let mut sums: Vec<Vec<f32>> = Vec::new();
     let mut of: Vec<Option<usize>> = vec![None; pieces.len()];
 
-    let mut seeds: Vec<usize> = (0..pieces.len())
-        .filter(|&i| secs(&pieces[i]) >= GROUP_SEED_SECS && !pieces[i].embedding.is_empty())
+    let mut order: Vec<usize> = (0..pieces.len())
+        .filter(|&i| secs(&pieces[i]) >= GROUP_PIECE_SECS && !pieces[i].embedding.is_empty())
         .collect();
-    seeds.sort_by(|&a, &b| secs(&pieces[b]).total_cmp(&secs(&pieces[a])));
-    for &i in &seeds {
+    order.sort_by(|&a, &b| secs(&pieces[b]).total_cmp(&secs(&pieces[a])));
+    for &i in &order {
         let piece = &pieces[i];
         let norm = piece.embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
         if norm == 0.0 {
@@ -116,28 +111,31 @@ pub fn group_voices(pieces: &[VoicePiece<'_>]) -> (Vec<VoiceGroup>, Vec<Option<u
         groups[index].secs += secs(piece);
         of[i] = Some(index);
     }
+    (groups, of)
+}
 
-    let placed: Vec<Option<usize>> = of.clone();
-    for i in 0..pieces.len() {
-        if placed[i].is_some() {
+/// Give each piece that has no speaker the speaker of the piece next to it in
+/// time: the one before it within [`NEIGHBOUR_GAP_SECS`], else the one after.
+/// Only pieces that had a speaker coming in are followed, so a label does not
+/// travel down a chain of scraps. A short piece is far more often the same
+/// person carrying on than anything its own sample can show.
+pub fn follow_neighbours(spans: &[(f64, f64)], speakers: &mut [Option<i64>]) {
+    let known: Vec<Option<i64>> = speakers.to_vec();
+    for i in 0..spans.len() {
+        if known[i].is_some() {
             continue;
         }
-        let piece = &pieces[i];
-        let before = (0..pieces.len())
-            .filter(|&j| placed[j].is_some() && pieces[j].end <= piece.start + 1e-6)
-            .max_by(|&a, &b| pieces[a].end.total_cmp(&pieces[b].end))
-            .filter(|&j| piece.start - pieces[j].end <= NEIGHBOUR_GAP_SECS);
-        let after = (0..pieces.len())
-            .filter(|&j| placed[j].is_some() && pieces[j].start + 1e-6 >= piece.end)
-            .min_by(|&a, &b| pieces[a].start.total_cmp(&pieces[b].start))
-            .filter(|&j| pieces[j].start - piece.end <= NEIGHBOUR_GAP_SECS);
-        of[i] = before.or(after).and_then(|j| placed[j]).or_else(|| {
-            nearest(&groups, piece.embedding)
-                .filter(|(_, distance)| *distance < SHORT_PIECE_MAX_DISTANCE)
-                .map(|(index, _)| index)
-        });
+        let (start, end) = spans[i];
+        let before = (0..spans.len())
+            .filter(|&j| known[j].is_some() && spans[j].1 <= start + 1e-6)
+            .max_by(|&a, &b| spans[a].1.total_cmp(&spans[b].1))
+            .filter(|&j| start - spans[j].1 <= NEIGHBOUR_GAP_SECS);
+        let after = (0..spans.len())
+            .filter(|&j| known[j].is_some() && spans[j].0 + 1e-6 >= end)
+            .min_by(|&a, &b| spans[a].0.total_cmp(&spans[b].0))
+            .filter(|&j| spans[j].0 - end <= NEIGHBOUR_GAP_SECS);
+        speakers[i] = before.or(after).and_then(|j| known[j]);
     }
-    (groups, of)
 }
 
 #[cfg(test)]
@@ -188,50 +186,57 @@ mod tests {
     }
 
     #[test]
-    fn a_short_piece_cannot_found_a_voice() {
-        let (a, odd) = (voice(0.0), voice(90.0));
-        // Far from the only group and far from it in time: nobody's.
-        let (groups, of) = group_voices(&[piece(0.0, 4.0, &a), piece(10.0, 11.0, &odd)]);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(of, vec![Some(0), None]);
-    }
-
-    #[test]
-    fn a_short_piece_goes_with_its_neighbour_in_time() {
-        let (a, b, odd) = (voice(0.0), voice(90.0), voice(200.0));
-        let (_, of) = group_voices(&[
-            piece(0.0, 4.0, &a),
-            piece(4.5, 5.5, &odd), // just after a's piece
-            piece(10.0, 14.0, &b),
-            piece(9.0, 9.8, &odd), // nothing before it within reach, b right after
+    fn scraps_of_one_voice_pool_into_one_group() {
+        let (a, b) = (voice(0.0), voice(30.0));
+        let (groups, of) = group_voices(&[
+            piece(0.0, 1.7, &a),
+            piece(2.0, 4.0, &b),
+            piece(4.5, 6.2, &a),
         ]);
-        assert_eq!(of[1], of[0]);
-        assert_eq!(of[3], of[2]);
-    }
-
-    #[test]
-    fn a_short_piece_alone_joins_only_a_group_it_sounds_much_like() {
-        // 40 degrees is a distance of 0.23, 66 degrees one of 0.59.
-        let (a, near, far) = (voice(0.0), voice(40.0), voice(66.0));
-        let (_, of) = group_voices(&[
-            piece(0.0, 4.0, &a),
-            piece(10.0, 11.0, &near),
-            piece(20.0, 21.0, &far),
-        ]);
-        assert_eq!(of, vec![Some(0), Some(0), None]);
-    }
-
-    #[test]
-    fn a_two_second_scrap_cannot_found_a_voice() {
-        let (a, odd) = (voice(0.0), voice(90.0));
-        let (groups, _) = group_voices(&[piece(0.0, 4.0, &a), piece(10.0, 12.0, &odd)]);
         assert_eq!(groups.len(), 1);
+        assert_eq!(of, vec![Some(0); 3]);
+        assert!(groups[0].secs >= GROUP_VOICE_SECS);
     }
 
     #[test]
-    fn a_piece_without_a_sample_follows_its_neighbour() {
+    fn a_lone_scrap_is_a_group_too_small_to_be_a_voice() {
+        let (a, odd) = (voice(0.0), voice(90.0));
+        let (groups, of) = group_voices(&[piece(0.0, 6.0, &a), piece(10.0, 12.0, &odd)]);
+        assert_eq!(groups.len(), 2);
+        assert!(groups[of[1].unwrap()].secs < GROUP_VOICE_SECS);
+    }
+
+    #[test]
+    fn a_piece_under_a_second_or_without_a_sample_is_in_no_group() {
         let a = voice(0.0);
-        let (_, of) = group_voices(&[piece(0.0, 4.0, &a), piece(4.3, 9.0, &[])]);
-        assert_eq!(of, vec![Some(0), Some(0)]);
+        let (_, of) = group_voices(&[
+            piece(0.0, 4.0, &a),
+            piece(4.2, 4.9, &a),
+            piece(5.0, 9.0, &[]),
+        ]);
+        assert_eq!(of, vec![Some(0), None, None]);
+    }
+
+    #[test]
+    fn a_piece_without_a_speaker_follows_its_neighbour_in_time() {
+        let spans = [
+            (0.0, 4.0),
+            (4.5, 5.5),
+            (9.0, 9.8),
+            (10.0, 14.0),
+            (30.0, 31.0),
+        ];
+        let mut speakers = [Some(1), None, None, Some(2), None];
+        follow_neighbours(&spans, &mut speakers);
+        // After 1's piece; just before 2's; and too far from anybody.
+        assert_eq!(speakers, [Some(1), Some(1), Some(2), Some(2), None]);
+    }
+
+    #[test]
+    fn a_followed_label_does_not_travel_down_a_chain() {
+        let spans = [(0.0, 4.0), (5.0, 6.0), (7.0, 8.0)];
+        let mut speakers = [Some(1), None, None];
+        follow_neighbours(&spans, &mut speakers);
+        assert_eq!(speakers, [Some(1), Some(1), None]);
     }
 }

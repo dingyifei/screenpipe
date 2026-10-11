@@ -510,7 +510,7 @@ pub(crate) async fn teach_speaker_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<TeachSpeakerRequest>,
 ) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
-    use screenpipe_audio::speaker::voice_groups::{group_voices, VoicePiece, GROUP_SEED_SECS};
+    use screenpipe_audio::speaker::voice_groups::{group_voices, VoicePiece, GROUP_PIECE_SECS};
 
     let span = (request.end - request.start).num_seconds();
     if span <= 0 || span > TEACH_MAX_RANGE_SECS {
@@ -605,7 +605,7 @@ pub(crate) async fn teach_speaker_handler(
         let mut members: Vec<&(f64, f64, Vec<f32>)> = pieces
             .iter()
             .zip(&of)
-            .filter(|(piece, group)| **group == Some(main) && piece.1 - piece.0 >= GROUP_SEED_SECS)
+            .filter(|(piece, group)| **group == Some(main) && piece.1 - piece.0 >= GROUP_PIECE_SECS)
             .map(|(piece, _)| piece)
             .collect();
         members.sort_by(|a, b| (b.1 - b.0).total_cmp(&(a.1 - a.0)));

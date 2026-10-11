@@ -490,9 +490,11 @@ async fn known_speaker(state: &AppState, embedding: &[f32], secs: f64) -> Option
 /// Give each segment of one file its speaker. The segments are grouped by
 /// voice first (`group_voices`) and each group is looked up once, with its
 /// pooled sample and its total speech: a lookup per segment cut one narrator
-/// into three speakers and left the short segments with none. A group nobody
-/// matches becomes a new speaker when it holds enough speech. A segment
-/// outside every group gets no speaker: too short, and next to nobody.
+/// into three speakers and left the short segments with none. A group with
+/// `GROUP_VOICE_SECS` of speech is matched as a voice of the conversation,
+/// trains the speaker it matches, and becomes a new speaker when it matches
+/// nobody. A smaller one is only matched, at the general limit. A segment
+/// left without a speaker takes the one next to it in time.
 ///
 /// `recent` are the speakers of the conversation so far; the ones found here
 /// are added to it.
@@ -503,7 +505,9 @@ async fn assign_speakers(
     mut recent: Option<&mut Vec<i64>>,
     chunk_id: i64,
 ) {
-    use screenpipe_audio::speaker::voice_groups::{group_voices, VoicePiece};
+    use screenpipe_audio::speaker::voice_groups::{
+        follow_neighbours, group_voices, VoicePiece, GROUP_VOICE_SECS,
+    };
     let pieces: Vec<VoicePiece<'_>> = results
         .iter()
         .zip(voices)
@@ -517,23 +521,27 @@ async fn assign_speakers(
     drop(pieces);
     let mut group_speaker: Vec<Option<i64>> = Vec::with_capacity(groups.len());
     for group in &groups {
-        let known = recent.as_deref().map(|r| r.as_slice()).unwrap_or(&[]);
-        let speaker = match screenpipe_audio::transcription::get_or_create_speaker_in_conversation(
-            &state.db,
-            &group.embedding,
-            group.secs,
-            known,
-        )
-        .await
-        {
-            Ok(speaker) => speaker.map(|s| s.id),
-            Err(e) => {
-                warn!(
-                    "retranscribe: speaker lookup failed for chunk {}: {}",
-                    chunk_id, e
-                );
-                None
+        let speaker = if group.secs >= GROUP_VOICE_SECS {
+            let known = recent.as_deref().map(|r| r.as_slice()).unwrap_or(&[]);
+            match screenpipe_audio::transcription::get_or_create_speaker_in_conversation(
+                &state.db,
+                &group.embedding,
+                group.secs,
+                known,
+            )
+            .await
+            {
+                Ok(speaker) => speaker.map(|s| s.id),
+                Err(e) => {
+                    warn!(
+                        "retranscribe: speaker lookup failed for chunk {}: {}",
+                        chunk_id, e
+                    );
+                    None
+                }
             }
+        } else {
+            known_speaker(state, &group.embedding, group.secs).await
         };
         if let (Some(id), Some(recent)) = (speaker, recent.as_deref_mut()) {
             if !recent.contains(&id) && recent.len() < RECENT_SPEAKERS_MAX {
@@ -542,8 +550,14 @@ async fn assign_speakers(
         }
         group_speaker.push(speaker);
     }
-    for (index, result) in results.iter_mut().enumerate() {
-        result.speaker_id = of[index].and_then(|group| group_speaker[group]);
+    let mut speakers: Vec<Option<i64>> = of
+        .iter()
+        .map(|group| group.and_then(|group| group_speaker[group]))
+        .collect();
+    let spans: Vec<(f64, f64)> = results.iter().map(|r| (r.start, r.end)).collect();
+    follow_neighbours(&spans, &mut speakers);
+    for (result, speaker) in results.iter_mut().zip(speakers) {
+        result.speaker_id = speaker;
     }
 }
 
