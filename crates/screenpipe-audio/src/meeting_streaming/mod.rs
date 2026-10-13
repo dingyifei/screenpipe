@@ -21,7 +21,7 @@ pub use live_speaker::{
     install_live_speaker_identifier, MeetingTranscriptSpeaker, MEETING_TRANSCRIPT_SPEAKER_EVENT,
 };
 pub use voice_tracks::{
-    name_track, speaker_merged, track_spans, voiced_in, MeetingVoiceActivity, MeetingVoiceLine,
+    name_track, speaker_merged, track_spans, MeetingVoiceActivity, MeetingVoiceLine,
     MeetingVoiceTrack, TrackSpan, MEETING_VOICE_ACTIVITY_EVENT, MEETING_VOICE_LINE_EVENT,
     MEETING_VOICE_TRACK_EVENT,
 };

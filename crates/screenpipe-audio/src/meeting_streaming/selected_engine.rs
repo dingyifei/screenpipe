@@ -43,8 +43,6 @@ const PAUSE_TAIL: Duration = Duration::from_millis(400);
 /// Tail energy, relative to the whole buffer, below which the speaker has paused.
 const PAUSE_RELATIVE_RMS: f32 = 0.35;
 const MIN_LIVE_RMS: f32 = 0.003;
-/// This much voice in a chunk by the voice tracker's count passes the speech gate by itself.
-const VOICED_PASS_MS: u64 = 1_000;
 /// While a sentence is still being spoken, what there is of it so far is
 /// transcribed again each time it has grown by this much, and shown in place
 /// of the last attempt. The speech model takes whole clips only, so this is
@@ -597,31 +595,21 @@ fn hand_off(buffer: &mut LiveChunkBuffer, mailbox: &ChunkMailbox, levels: Option
     mailbox.put(chunk);
 }
 
-/// How long the voice tracker heard somebody in a chunk, for the speech gate;
-/// 0 when the device is not followed.
+/// Whether the sound tagger may lift the speech detector's verdict on a chunk
+/// ([`crate::vad::sound_tags`]: it hears singing, which the detector does not).
 ///
-/// On a microphone the tracker also hears the loudspeakers from across the
-/// room, and passing that wrote every sentence of the other side a second
-/// time. So a microphone's count is used only while the system audio is known
-/// to be quiet (or the meeting has none): what the tracker hears then is in
-/// the room. A singer over music on headphones is not helped by this; the
-/// recorder cannot tell headphones from loudspeakers.
-fn voiced_ms(
-    tracker: Option<&VoiceTracker>,
-    chunk: &LiveChunk,
-    meeting_id: i64,
-    device_type: &str,
-) -> u64 {
-    let (start_ms, end_ms) = (chunk.captured_at_unix_ms, chunk.end_ms());
-    if device_type != "output"
-        && !matches!(
-            system_audio(meeting_id, start_ms, end_ms),
+/// On a microphone it also hears the loudspeakers from across the room, and
+/// passing that wrote every sentence of the other side a second time. So for a
+/// microphone it is consulted only while the system audio is known to be quiet
+/// (or the meeting has none): what it hears then is in the room. A singer over
+/// music on headphones is not helped by this; the recorder cannot tell
+/// headphones from loudspeakers.
+fn tags_count(chunk: &LiveChunk, meeting_id: i64, device_type: &str) -> bool {
+    device_type == "output"
+        || matches!(
+            system_audio(meeting_id, chunk.captured_at_unix_ms, chunk.end_ms()),
             SystemAudio::Quiet | SystemAudio::Absent
         )
-    {
-        return 0;
-    }
-    tracker.map_or(0, |tracker| tracker.voiced_ms(start_ms, end_ms))
 }
 
 /// Speech gate for live chunks: the same VAD criterion the batch path applies
@@ -632,6 +620,7 @@ fn voiced_ms(
 struct VoiceGate {
     vad: Option<tokio::sync::Mutex<Box<dyn crate::vad::VadEngine>>>,
     is_output_device: bool,
+    tagger: Option<Arc<crate::vad::sound_tags::SoundTagger>>,
 }
 
 impl VoiceGate {
@@ -649,6 +638,7 @@ impl VoiceGate {
         Self {
             vad,
             is_output_device,
+            tagger: crate::vad::sound_tags::tagger(),
         }
     }
 
@@ -666,17 +656,27 @@ impl VoiceGate {
         Some(crate::vad::speech_ratio(samples_16k, vad, self.is_output_device).await)
     }
 
-    /// A second of voice by the tracker's count passes a chunk by itself
-    /// (see [`voiced_ms`] for when a microphone's count is used at all).
-    fn voiced(&self, voiced_ms: u64) -> bool {
-        voiced_ms >= VOICED_PASS_MS
+    /// `true` when the sound tagger hears speech or singing in the chunk; asked
+    /// only after the detector said no, so talk costs nothing extra. On the CPU,
+    /// about 40 ms for an 8 s cut.
+    async fn tagged_voice(&self, samples_16k: &[f32]) -> bool {
+        let Some(tagger) = self.tagger.clone() else {
+            return false;
+        };
+        let samples = samples_16k.to_vec();
+        tokio::task::spawn_blocking(move || tagger.voice_scores(&samples))
+            .await
+            .ok()
+            .and_then(|scores| scores.map_err(|e| debug!("sound tags: {e:#}")).ok())
+            .is_some_and(|scores| crate::vad::sound_tags::has_voice(&scores))
     }
 
     /// `true` when a preview is worth transcribing. Not announced: the finished cut will be.
-    async fn hears_speech(&self, samples_16k: &[f32], voiced_ms: u64) -> bool {
+    async fn hears_speech(&self, samples_16k: &[f32], tags_count: bool) -> bool {
         match self.speech_ratio(samples_16k).await {
             Some(ratio) => {
-                ratio > crate::vad::asked_for_min_speech_ratio() || self.voiced(voiced_ms)
+                ratio > crate::vad::asked_for_min_speech_ratio()
+                    || (tags_count && self.tagged_voice(samples_16k).await)
             }
             None => true,
         }
@@ -685,14 +685,13 @@ impl VoiceGate {
     /// `true` when the chunk should be transcribed, announcing the verdict.
     /// Without a detector nothing is gated and nothing is announced.
     ///
-    /// `voiced_ms` is how long the voice tracker heard somebody in the chunk.
-    /// The detector is trained on talk and scores singing as nothing; the
-    /// tracker follows voices and hears it, so a second of voice by its count
-    /// passes a chunk the detector would hold.
+    /// The detector is trained on talk and scores singing as nothing; with
+    /// `tags_count` (see [`tags_count`]) the sound tagger hearing speech or
+    /// singing passes a chunk the detector would hold.
     async fn passes(
         &self,
         samples_16k: &[f32],
-        voiced_ms: u64,
+        tags_count: bool,
         meeting_id: i64,
         device_name: &str,
         device_type: &str,
@@ -701,7 +700,8 @@ impl VoiceGate {
             return true;
         };
         let min_speech_ratio = crate::vad::asked_for_min_speech_ratio();
-        let passed = speech_ratio > min_speech_ratio || self.voiced(voiced_ms);
+        let passed =
+            speech_ratio > min_speech_ratio || (tags_count && self.tagged_voice(samples_16k).await);
         let _ = screenpipe_events::send_event(
             "meeting_streaming_voice_gate",
             MeetingStreamingVoiceGate {
@@ -743,7 +743,6 @@ async fn transcribe_loop(
                 show_preview(
                     chunk,
                     &voice_gate,
-                    tracker.as_deref(),
                     &mut session,
                     &config,
                     meeting_id,
@@ -757,7 +756,7 @@ async fn transcribe_loop(
             } else if !voice_gate
                 .passes(
                     &chunk.samples,
-                    voiced_ms(tracker.as_deref(), &chunk, meeting_id, &device_type),
+                    tags_count(&chunk, meeting_id, &device_type),
                     meeting_id,
                     &device_name,
                     &device_type,
@@ -799,7 +798,7 @@ async fn transcribe_loop(
             || !voice_gate
                 .passes(
                     &chunk.samples,
-                    voiced_ms(tracker.as_deref(), &chunk, meeting_id, &device_type),
+                    tags_count(&chunk, meeting_id, &device_type),
                     meeting_id,
                     &device_name,
                     &device_type,
@@ -843,7 +842,6 @@ fn live_item_id(stream_id: &str, device_type: &str, captured_at_unix_ms: u64) ->
 async fn show_preview(
     chunk: LiveChunk,
     voice_gate: &VoiceGate,
-    tracker: Option<&VoiceTracker>,
     session: &mut TranscriptionSession,
     config: &MeetingStreamingConfig,
     meeting_id: i64,
@@ -853,10 +851,7 @@ async fn show_preview(
     model: Option<String>,
 ) {
     if !voice_gate
-        .hears_speech(
-            &chunk.samples,
-            voiced_ms(tracker, &chunk, meeting_id, device_type),
-        )
+        .hears_speech(&chunk.samples, tags_count(&chunk, meeting_id, device_type))
         .await
     {
         return;
@@ -1364,24 +1359,21 @@ mod tests {
             .map(|i| if (i * 7919) % 13 < 6 { 0.006 } else { -0.006 })
             .collect();
         assert!(rms(&noise) >= MIN_LIVE_RMS);
-        assert!(!gate.passes(&noise, 0, 1, "Mic", "input").await);
-        assert!(!gate.passes(&[], 0, 1, "Mic", "input").await);
+        assert!(!gate.passes(&noise, false, 1, "Mic", "input").await);
+        assert!(!gate.passes(&[], false, 1, "Mic", "input").await);
     }
 
     #[tokio::test]
-    async fn voice_gate_passes_what_the_tracker_heard_as_a_voice() {
-        let gate = VoiceGate::new(true).await;
+    async fn without_a_tagger_the_gate_is_the_detector_alone() {
+        let mut gate = VoiceGate::new(true).await;
         if gate.vad.is_none() {
             return;
         }
+        gate.tagger = None;
         let quiet = vec![0.0f32; LIVE_SAMPLE_RATE as usize * 2];
-        assert!(
-            !gate
-                .passes(&quiet, VOICED_PASS_MS - 1, 1, "Mic", "input")
-                .await
-        );
-        assert!(gate.passes(&quiet, VOICED_PASS_MS, 1, "Mic", "input").await);
-        assert!(gate.hears_speech(&quiet, VOICED_PASS_MS).await);
+        assert!(!gate.passes(&quiet, true, 1, "Mic", "input").await);
+        assert!(!gate.hears_speech(&quiet, true).await);
+        assert!(!gate.tagged_voice(&quiet).await);
     }
 
     /// A device of a meeting with `secs` of audio at one level from `start_ms`.
@@ -1429,22 +1421,29 @@ mod tests {
     }
 
     #[test]
-    fn a_microphone_uses_the_tracker_only_while_system_audio_is_quiet() {
+    fn a_microphone_uses_the_tags_only_while_system_audio_is_quiet() {
         let start = 3_000_000;
         let chunk = LiveChunk {
             samples: vec![0.1; LIVE_SAMPLE_RATE as usize * 4],
             captured_at_unix_ms: start,
             preview: false,
         };
-        // No tracker in a unit test, so the count is 0 either way; what is
-        // checked is that the system audio's state is consulted without panic
-        // and that the states map to "use" and "do not use".
+        // A meeting with no system audio: the room is all a microphone hears.
+        assert!(tags_count(&chunk, 9_105, "input"));
+        device(9_104, "System Audio", true, start, 0.0, 6);
+        assert_eq!(
+            system_audio(9_104, start, chunk.end_ms()),
+            SystemAudio::Quiet
+        );
+        assert!(tags_count(&chunk, 9_104, "input"));
+        forget_mic(9_104, "System Audio");
         device(9_104, "System Audio", true, start, 0.2, 6);
         assert_eq!(
             system_audio(9_104, start, chunk.end_ms()),
             SystemAudio::Sounding
         );
-        assert_eq!(voiced_ms(None, &chunk, 9_104, "input"), 0);
+        assert!(!tags_count(&chunk, 9_104, "input"));
+        assert!(tags_count(&chunk, 9_104, "output"));
         forget_mic(9_104, "System Audio");
     }
 
@@ -1584,8 +1583,9 @@ mod tests {
         let gate = VoiceGate {
             vad: None,
             is_output_device: false,
+            tagger: None,
         };
-        assert!(gate.passes(&[0.0; 1600], 0, 1, "Mic", "input").await);
+        assert!(gate.passes(&[0.0; 1600], false, 1, "Mic", "input").await);
     }
 
     #[test]
