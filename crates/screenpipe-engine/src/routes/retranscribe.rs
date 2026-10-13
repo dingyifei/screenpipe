@@ -225,8 +225,8 @@ const OTHER_MIC_FILES_KEPT: usize = 6;
 /// Audio taken either side of the matching span when asking what the other mic heard.
 const OTHER_MIC_TEXT_PAD_SECS: f64 = 0.3;
 
-/// A voice the tracker hears for this long in a file lifts the speech
-/// detector's verdict on it (the live gate's `VOICED_PASS_MS`).
+/// Speech or singing the sound tagger hears for this long in a file lifts the
+/// speech detector's verdict on it.
 const SUNG_MIN_SECS: f64 = 1.0;
 /// A stretch of voice no segment covers is added as pieces no longer than this.
 const SUNG_PIECE_MAX_SECS: f64 = 8.0;
@@ -396,9 +396,10 @@ async fn system_audio_around(
     Some(outputs)
 }
 
-/// For a file inside a session: where the voice tracker hears a voice that may
-/// lift the speech detector's verdict, which does not count singing. `None`
-/// for every other file, and whenever that cannot be established (no helper,
+/// For a file inside a session: where the sound tagger hears speech or singing
+/// that may lift the speech detector's verdict, which does not count singing
+/// (`screenpipe_audio::vad::sound_tags`, the live gate's rule). `None` for
+/// every other file, and whenever that cannot be established (no tagger,
 /// unreadable system audio): the file is then treated exactly as before.
 async fn sung_voice(
     state: &AppState,
@@ -414,9 +415,13 @@ async fn sung_voice(
     if power.sqrt() < 0.003 {
         return None;
     }
+    let tagger = screenpipe_audio::vad::sound_tags::tagger()?;
     let samples = samples_16k.to_vec();
     let voiced = tokio::task::spawn_blocking(move || {
-        screenpipe_audio::meeting_streaming::voiced_in(&samples)
+        tagger
+            .voice_scores(&samples)
+            .ok()
+            .map(|scores| screenpipe_audio::vad::sound_tags::voiced_stretches(&scores))
     })
     .await
     .ok()??;
