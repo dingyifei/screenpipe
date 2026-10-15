@@ -2163,6 +2163,14 @@ async fn main() -> anyhow::Result<()> {
         use std::sync::Arc;
 
         info!("starting async PII reconciliation worker (destructive overwrite of source columns)");
+        // Fork: with SCREENPIPE_REDACTION_DRAIN_GATE=1 the worker idles until
+        // POST /privacy/redaction/drain (a nightly job) opens it. Set before
+        // the worker exists so it never starts a batch ungated.
+        let drain_gated = screenpipe_redact::worker::drain::gate_from_env();
+        screenpipe_redact::worker::drain::set_gated(drain_gated);
+        if drain_gated {
+            info!("text-PII worker gated: redaction runs only during a requested drain");
+        }
 
         // Pipeline: regex pre-pass + AI fallback. Regex catches
         // structural PII deterministically and on-device. AI step

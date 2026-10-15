@@ -492,15 +492,27 @@ pub struct ElementRow {
 /// surface — `text` OR a `properties` JSON that may hold redactable fields.
 /// Newest-first. Container nodes with neither are never fetched (nothing to
 /// scrub, and they'd just churn the watermark).
+#[cfg(test)]
 pub async fn fetch_unredacted_elements(
     pool: &SqlitePool,
     limit: u32,
+) -> Result<Vec<ElementRow>, sqlx::Error> {
+    fetch_unredacted_elements_ordered(pool, limit, false).await
+}
+
+/// [`fetch_unredacted_elements`], oldest-first when `oldest_first` (the drain
+/// gate's order). Both orders walk the `redacted_at` index, whose NULL entries
+/// sit in rowid order, so neither degrades as stamped rows accumulate.
+pub async fn fetch_unredacted_elements_ordered(
+    pool: &SqlitePool,
+    limit: u32,
+    oldest_first: bool,
 ) -> Result<Vec<ElementRow>, sqlx::Error> {
     // `properties` is JSON; cheap LIKE pre-filters to rows that actually
     // carry one of the redactable string fields, so structural-only nodes
     // (is_enabled/role_description-less) never reach the model or even the
     // fetch. The `redacted_at IS NULL` index predicate runs first.
-    let q = "SELECT id, text, properties \
+    let newest_first = "SELECT id, text, properties \
              FROM elements \
              WHERE redacted_at IS NULL \
                AND ( (text IS NOT NULL AND text != '') \
@@ -512,6 +524,19 @@ pub async fn fetch_unredacted_elements(
                      OR properties LIKE '%\"url\"%' )) ) \
              ORDER BY id DESC \
              LIMIT ?";
+    let oldest = "SELECT id, text, properties \
+             FROM elements \
+             WHERE redacted_at IS NULL \
+               AND ( (text IS NOT NULL AND text != '') \
+                  OR (properties IS NOT NULL AND ( \
+                        properties LIKE '%\"value\"%' \
+                     OR properties LIKE '%\"placeholder\"%' \
+                     OR properties LIKE '%\"help_text\"%' \
+                     OR properties LIKE '%\"role_description\"%' \
+                     OR properties LIKE '%\"url\"%' )) ) \
+             ORDER BY id ASC \
+             LIMIT ?";
+    let q = if oldest_first { oldest } else { newest_first };
     let rows = sqlx::query(q).bind(limit as i64).fetch_all(pool).await?;
     let out = rows
         .into_iter()

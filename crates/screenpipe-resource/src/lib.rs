@@ -15,6 +15,7 @@ mod cpu;
 mod monitor;
 
 pub use cpu::{
+    active_cpu_target_override, clear_background_cpu_target, set_background_cpu_target_until,
     CpuBudgetConfig, CpuBudgetPermit, CpuBudgetSample, ResourceGovernor, WorkSliceConfig,
     WorkSliceController, DEFAULT_BACKGROUND_CPU_PERCENT,
 };

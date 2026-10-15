@@ -1468,6 +1468,13 @@ impl SCServer {
             crate::mcp_servers_api::router(mcp_store, self.mcp_session_access.clone()),
         );
 
+        // Fork: scheduled text-PII redaction drain (behind the API auth layer
+        // applied below, like /raw_sql).
+        let router = router.nest(
+            "/privacy/redaction",
+            crate::routes::privacy_redaction::router(app_state.db.clone()),
+        );
+
         // Power management routes (if power manager is available)
         let router = if let Some(ref pm) = self.power_manager {
             let power_routes = Router::new()

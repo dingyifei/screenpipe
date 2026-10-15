@@ -348,7 +348,11 @@ mod runtime {
     /// Loaded model + tokenizer + label vocabulary.
     pub struct OnnxRedactor {
         cfg: OnnxConfig,
-        session: Mutex<Session>,
+        /// One or more sessions over the same model. Each `run` locks one, so
+        /// N sessions let N callers infer at once (the nightly redaction
+        /// drain); the default is one, as upstream. See [`session_pool_size`].
+        sessions: Vec<Mutex<Session>>,
+        next_session: std::sync::atomic::AtomicUsize,
         tokenizer: Tokenizer,
         /// `id → "B-private_person"` from config.json.
         id2label: Vec<String>,
@@ -405,7 +409,17 @@ mod runtime {
                 .with_truncation(None)
                 .map_err(|e| RedactError::Runtime(format!("disable tokenizer truncation: {e}")))?;
 
-            let session = build_session(&model_path)?;
+            let threads = env_count(ORT_THREADS_ENV, 1, 8);
+            let sessions = (0..session_pool_size())
+                .map(|_| build_session(&model_path, threads).map(Mutex::new))
+                .collect::<Result<Vec<_>, _>>()?;
+            if sessions.len() > 1 || threads > 1 {
+                tracing::info!(
+                    sessions = sessions.len(),
+                    intra_threads = threads,
+                    "onnx text redaction session pool"
+                );
+            }
 
             // Optional vocab-prune remap. Present iff the model ships a
             // `remap.json` (pruned models); absent for full-vocab models.
@@ -413,7 +427,8 @@ mod runtime {
 
             Ok(Self {
                 cfg,
-                session: Mutex::new(session),
+                sessions,
+                next_session: std::sync::atomic::AtomicUsize::new(0),
                 tokenizer,
                 id2label,
                 remap,
@@ -607,10 +622,7 @@ mod runtime {
             let mask_arr = Array::from_shape_vec((batch_size, width), attention_mask)
                 .map_err(|e| RedactError::Runtime(format!("mask shape: {e}")))?;
 
-            let mut session = self
-                .session
-                .lock()
-                .map_err(|_| RedactError::Runtime("session mutex poisoned".into()))?;
+            let mut session = self.acquire_session()?;
 
             let inference_started = std::time::Instant::now();
             let outputs = session
@@ -738,7 +750,15 @@ mod runtime {
             &self,
             texts: &[String],
         ) -> Result<Vec<RedactionOutput>, RedactError> {
-            self.infer_batch(texts)
+            // Inference is synchronous CPU work. On a multi-thread runtime,
+            // hand this thread's other tasks off while it runs, so parallel
+            // callers (the drain) neither starve the runtime nor each other.
+            match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                    tokio::task::block_in_place(|| self.infer_batch(texts))
+                }
+                _ => self.infer_batch(texts),
+            }
         }
     }
 
@@ -926,7 +946,52 @@ mod runtime {
         Ok(out)
     }
 
-    fn build_session(model_path: &std::path::Path) -> Result<Session, RedactError> {
+    /// Env var: sessions in the pool (1–16, default 1).
+    pub const ORT_SESSIONS_ENV: &str = "SCREENPIPE_PII_ORT_SESSIONS";
+    /// Env var: intra-op threads per session (1–8, default 1).
+    pub const ORT_THREADS_ENV: &str = "SCREENPIPE_PII_ORT_THREADS";
+
+    fn env_count(name: &str, default: usize, max: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, max))
+            .unwrap_or(default)
+    }
+
+    /// Sessions to load. Each holds its own copy of the weights (~115 MB for
+    /// the int8 model), so the pool is opt-in.
+    pub fn session_pool_size() -> usize {
+        env_count(ORT_SESSIONS_ENV, 1, 16)
+    }
+
+    impl OnnxRedactor {
+        /// Lock a free session, else wait on the next in turn.
+        fn acquire_session(&self) -> Result<std::sync::MutexGuard<'_, Session>, RedactError> {
+            let n = self.sessions.len();
+            let start = self
+                .next_session
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % n;
+            for k in 0..n {
+                if let Ok(guard) = self.sessions[(start + k) % n].try_lock() {
+                    return Ok(guard);
+                }
+            }
+            self.sessions[start]
+                .lock()
+                .map_err(|_| RedactError::Runtime("session mutex poisoned".into()))
+        }
+
+        pub fn session_count(&self) -> usize {
+            self.sessions.len()
+        }
+    }
+
+    fn build_session(
+        model_path: &std::path::Path,
+        intra_threads: usize,
+    ) -> Result<Session, RedactError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             || -> Result<Session, ort::Error> {
                 // `mut`: rc.12's commit_from_file takes &mut self. Under
@@ -947,8 +1012,9 @@ mod runtime {
                     // This is background reconciliation, so latency is a
                     // non-goal. A single ORT thread prevents one inference from
                     // fanning out to 100-300% CPU before the worker's adaptive
-                    // process-level cooldown can react.
-                    .with_intra_threads(1)?;
+                    // process-level cooldown can react. (Fork: raised only by
+                    // SCREENPIPE_PII_ORT_THREADS, for the scheduled drain.)
+                    .with_intra_threads(intra_threads)?;
                 // NO CoreML EP here, deliberately: this text model is int8-quantized
                 // RoBERTa with dynamic sequence lengths, and the ANE compiler rejects
                 // every layer ("E5RT: unbounded dimension is not supported"), so

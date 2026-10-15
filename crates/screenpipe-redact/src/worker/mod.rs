@@ -17,6 +17,7 @@
 //! redactions until the worker catches up.
 
 mod columns;
+pub mod drain;
 mod hybrid;
 mod tables;
 
@@ -116,6 +117,17 @@ impl Default for WorkerConfig {
     }
 }
 
+/// Rows one drain batch takes for `table`. Frames are seconds each, so a few
+/// per parallel slot; elements average a couple dozen bytes, so many.
+fn drain_batch_limit(table: TargetTable, parallelism: usize) -> u32 {
+    let p = parallelism.max(1) as u32;
+    match table {
+        TargetTable::FullText => p * 4,
+        TargetTable::Elements => p * 128,
+        _ => 64,
+    }
+}
+
 /// Public status the worker exposes (used by Settings UI).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct WorkerStatus {
@@ -210,6 +222,14 @@ impl Worker {
             let mut s = self.status.lock().await;
             s.running = true;
         }
+        // The text-PII worker (not the sessions-only scrub) reports through
+        // the drain endpoints.
+        if !self.cfg.tables.is_empty() {
+            drain::register(&self);
+            if drain::is_gated() {
+                info!("redaction worker gated: idle until a drain is requested");
+            }
+        }
 
         // Helper: race a future against the optional shutdown signal.
         // If shutdown fires, return None and the caller breaks out of the
@@ -296,8 +316,11 @@ impl Worker {
             .collect();
 
         loop {
+            // A gated worker waits for a drain (the sessions-only scrub,
+            // which has no tables, is never gated).
             if self.paused.load(std::sync::atomic::Ordering::SeqCst)
                 || screenpipe_resource::background_work::is_suspended()
+                || (!self.cfg.tables.is_empty() && !drain::may_run())
             {
                 self.set_paused(true).await;
                 if race(time::sleep(self.cfg.poll_interval), shutdown.as_ref())
@@ -334,7 +357,15 @@ impl Worker {
 
                 // Race the table work against shutdown so a long redact batch
                 // doesn't hold us through tokio teardown.
-                let batch_limit = batch_sizers[table_index].current_units();
+                // While draining, batches are sized for `parallelism` units in
+                // flight and the adaptive sizer (tuned for 250 ms slices under
+                // the CPU budget) is bypassed.
+                let draining = drain::draining();
+                let batch_limit = if draining {
+                    drain_batch_limit(*table, drain::parallelism())
+                } else {
+                    batch_sizers[table_index].current_units()
+                };
                 let batch_start = std::time::Instant::now();
                 let result = match shutdown.as_ref() {
                     Some(n) => tokio::select! {
@@ -354,7 +385,20 @@ impl Worker {
 
                         let worked = batch_start.elapsed();
                         let target_slice = batch_sizers[table_index].target_duration();
-                        let next_batch_limit = batch_sizers[table_index].observe(worked);
+                        let next_batch_limit = if draining {
+                            batch_limit
+                        } else {
+                            batch_sizers[table_index].observe(worked)
+                        };
+                        if draining {
+                            info!(
+                                table = ?table,
+                                work_units = n,
+                                worked_ms = worked.as_millis(),
+                                parallelism = drain::parallelism(),
+                                "redaction drain batch"
+                            );
+                        }
                         let cpu_sample = cpu_permit.as_ref().map(|permit| {
                             permit.finish(
                                 worked,
@@ -544,11 +588,53 @@ impl Worker {
         if !cols.element_text && !cols.element_properties {
             return Ok(0);
         }
-        let fields = cols.a11y_json_fields();
-        let rows = tables::fetch_unredacted_elements(&self.pool, batch_size).await?;
+        let rows =
+            tables::fetch_unredacted_elements_ordered(&self.pool, batch_size, drain::is_gated())
+                .await?;
         if rows.is_empty() {
             return Ok(0);
         }
+        let parallelism = drain::parallelism();
+        if parallelism <= 1 || rows.len() < 2 * parallelism {
+            return self.process_element_rows(rows).await;
+        }
+        // Draining: split the batch into `parallelism` contiguous chunks, one
+        // task each (each blocks a runtime thread in its ONNX call). Every
+        // chunk runs to completion; the first error is returned after.
+        let chunk_len = rows.len().div_ceil(parallelism);
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut rows = rows.into_iter().peekable();
+        while rows.peek().is_some() {
+            let chunk: Vec<tables::ElementRow> = rows.by_ref().take(chunk_len).collect();
+            let worker = self.clone();
+            tasks.spawn(async move { worker.process_element_rows(chunk).await });
+        }
+        let mut n = 0;
+        let mut first_error = None;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok(done)) => n += done,
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(join) => {
+                    first_error.get_or_insert(anyhow::anyhow!("element task failed: {join}"));
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(n),
+        }
+    }
+
+    /// Redact and write back one fetched set of `elements` rows.
+    async fn process_element_rows(
+        &self,
+        rows: Vec<tables::ElementRow>,
+    ) -> Result<u32, anyhow::Error> {
+        let cols = self.cfg.columns;
+        let fields = cols.a11y_json_fields();
         debug!(
             count = rows.len(),
             "redacting elements batch (text + properties)"
