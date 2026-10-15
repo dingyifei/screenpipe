@@ -14,6 +14,44 @@ pub const DEFAULT_BACKGROUND_CPU_PERCENT: f32 = 30.0;
 
 const DEFAULT_FAST_SLICES_BEFORE_GROWTH: u8 = 3;
 
+/// A temporary process-wide CPU target that replaces every governor's
+/// configured target until it expires. A scheduled drain (the nightly
+/// redaction drain) raises it so the lane's users stop resting between
+/// batches; it lapses by itself, so a crashed or forgotten caller cannot
+/// leave the process unthrottled. Unlike the configured target it may exceed
+/// 100% (one core), up to every core.
+static CPU_TARGET_OVERRIDE: Mutex<Option<(f32, Instant)>> = Mutex::new(None);
+
+/// Replace the background CPU target with `percent` until `until`.
+pub fn set_background_cpu_target_until(percent: f32, until: Instant) {
+    let ceiling = std::thread::available_parallelism()
+        .map(|n| n.get() as f32 * 100.0)
+        .unwrap_or(100.0);
+    if let Ok(mut slot) = CPU_TARGET_OVERRIDE.lock() {
+        *slot = Some((percent.clamp(5.0, ceiling.max(100.0)), until));
+    }
+}
+
+/// Drop the override; configured targets apply again.
+pub fn clear_background_cpu_target() {
+    if let Ok(mut slot) = CPU_TARGET_OVERRIDE.lock() {
+        *slot = None;
+    }
+}
+
+/// The override in force now, if any.
+pub fn active_cpu_target_override() -> Option<f32> {
+    let mut slot = CPU_TARGET_OVERRIDE.lock().ok()?;
+    match *slot {
+        Some((percent, until)) if Instant::now() < until => Some(percent),
+        Some(_) => {
+            *slot = None;
+            None
+        }
+        None => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CpuBudgetConfig {
     pub target_process_cpu_percent: f32,
@@ -204,12 +242,13 @@ impl CpuBudgetPermit {
         max_cooldown: Duration,
     ) -> CpuBudgetSample {
         let active_cpu_percent = self.governor.cpu.sample();
-        let target_cpu_percent = self
-            .governor
-            .cpu
-            .config
-            .target_process_cpu_percent
-            .clamp(5.0, 100.0);
+        let target_cpu_percent = active_cpu_target_override().unwrap_or_else(|| {
+            self.governor
+                .cpu
+                .config
+                .target_process_cpu_percent
+                .clamp(5.0, 100.0)
+        });
         let cooldown = cooldown_after_cpu(
             worked,
             active_cpu_percent,
@@ -315,6 +354,19 @@ mod tests {
             MIN,
             MAX,
         )
+    }
+
+    #[test]
+    fn cpu_target_override_applies_until_it_expires() {
+        set_background_cpu_target_until(800.0, Instant::now() + Duration::from_secs(60));
+        let target = active_cpu_target_override().unwrap();
+        assert!(target >= 100.0, "may exceed one core, up to every core");
+        clear_background_cpu_target();
+        assert!(active_cpu_target_override().is_none());
+
+        set_background_cpu_target_until(800.0, Instant::now());
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(active_cpu_target_override().is_none(), "lapses by itself");
     }
 
     #[test]
