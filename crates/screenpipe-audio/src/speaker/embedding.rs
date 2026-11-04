@@ -21,9 +21,17 @@ fn fbank_input_too_short(num_samples: usize) -> bool {
     num_samples < MIN_FBANK_SAMPLES
 }
 
+/// Length of a stored voice vector: the database column is `FLOAT[512]` with
+/// a length check, and the npm CLI shares that schema, so it cannot change. A
+/// model with fewer dimensions (3D-Speaker CAM++: 192) is padded with zeros,
+/// which leaves every cosine distance exactly as the model made it.
+pub const VOICE_DIM: usize = 512;
+
 #[derive(Debug)]
 pub struct EmbeddingExtractor {
     session: ort::session::Session,
+    // Input node name: wespeaker exports call it "feats", 3D-Speaker's "x".
+    input_name: String,
     // Output node name of the embedding model, resolved once at load time.
     // Canonical exports name it "embs"; see `super::resolve_output_name`.
     output_name: String,
@@ -34,8 +42,14 @@ impl EmbeddingExtractor {
         let session = super::create_embedding_session(&model_path)?;
         let output_name =
             super::resolve_output_name(&super::session_output_names(&session), "embs")?;
+        let input_name = session
+            .inputs()
+            .first()
+            .map(|i| i.name().to_string())
+            .context("speaker embedding model has no input")?;
         Ok(Self {
             session,
+            input_name,
             output_name,
         })
     }
@@ -69,7 +83,7 @@ impl EmbeddingExtractor {
             Array2::from_shape_vec((rows, cols), features_016.into_raw_vec_and_offset().0)
                 .context("fbank shape roundtrip failed")?;
         let features = features.insert_axis(ndarray::Axis(0)); // Add batch dimension
-        let inputs = ort::inputs!["feats" => ort::value::TensorRef::from_array_view(&features)
+        let inputs = ort::inputs![self.input_name.as_str() => ort::value::TensorRef::from_array_view(&features)
             .map_err(|e| anyhow::anyhow!("ort: {e}"))?];
 
         let ort_outs = self
@@ -82,8 +96,15 @@ impl EmbeddingExtractor {
             .try_extract_array::<f32>()
             .context("Failed to extract tensor")?;
 
-        // Collect the tensor data into a Vec to own it
-        let embeddings: Vec<f32> = ort_out.iter().copied().collect();
+        // Collect the tensor data into a Vec to own it, padded to VOICE_DIM.
+        let mut embeddings: Vec<f32> = ort_out.iter().copied().collect();
+        anyhow::ensure!(
+            embeddings.len() <= VOICE_DIM,
+            "speaker embedding has {} dimensions, more than the {} stored",
+            embeddings.len(),
+            VOICE_DIM
+        );
+        embeddings.resize(VOICE_DIM, 0.0);
 
         // Return an iterator over the Vec
         Ok(embeddings.into_iter())
@@ -118,6 +139,7 @@ mod tests {
                 model,
                 crate::speaker::SessionKind::EmbeddingCpu,
             )?,
+            input_name: "feats".to_string(),
             output_name: "embs".to_string(),
         })
     }
@@ -132,6 +154,7 @@ mod tests {
         let mut compatibility = compatibility_extractor(&model)?;
         let mut cpu = EmbeddingExtractor {
             session: crate::speaker::create_session(&model)?,
+            input_name: "feats".to_string(),
             output_name: "embs".to_string(),
         };
         for samples in [1_600, 16_000, 80_000, 320_000, 480_000] {

@@ -875,16 +875,31 @@ pub(crate) async fn unmerge_speakers_handler(
     Json(request): Json<UnmergeRequest>,
 ) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
     match state.db.unmerge_speakers(request.merge_id).await {
-        Ok(undone) => Ok(JsonResponse(json!({
+        Ok(undone) => {
+            // The log's copy of the voice is gone when the voice model changed
+            // since the merge (patch 25): learn it again from the lines.
+            let mut samples_learned = 0;
+            if undone.samples_restored == 0 && state.db.speaker_sample_count(undone.merged_id).await.unwrap_or(0) == 0 {
+                let lines: Vec<MovedLine> = undone.restored_lines.iter()
+                    .map(|(chunk, start, end)| MovedLine { audio_chunk_id: *chunk, start_time: *start, end_time: *end })
+                    .collect();
+                let voices: Vec<Vec<f32>> = voices_of_lines(&state, &lines).await.into_iter().map(|(_, v)| v).collect();
+                if !voices.is_empty() && state.db.replace_speaker_embeddings(undone.merged_id, &voices).await.is_ok() {
+                    samples_learned = voices.len().min(screenpipe_db::SPEAKER_MAX_STORED_EMBEDDINGS);
+                }
+            }
+            Ok(JsonResponse(json!({
             "kept_id": undone.kept_id,
             "merged_id": undone.merged_id,
             "lines_restored": undone.lines_restored,
             "lines_left": undone.lines_left,
             "samples_restored": undone.samples_restored,
+            "samples_learned": samples_learned,
             "restored_lines": undone.restored_lines.iter()
                 .map(|(chunk, start, end)| json!({"audio_chunk_id": chunk, "start_time": start, "end_time": end}))
                 .collect::<Vec<_>>(),
-        }))),
+        })))
+        }
         Err(sqlx::Error::RowNotFound) => Err((
             StatusCode::NOT_FOUND,
             JsonResponse(json!({"error": "no such merge, it was already undone, or the speaker it was merged into is gone"})),

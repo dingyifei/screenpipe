@@ -464,7 +464,10 @@ pub fn get_speaker_from_embedding(
     embedding_manager: &mut EmbeddingManager,
     embedding: Vec<f32>,
 ) -> String {
-    let search_threshold = 0.35; // cosine similarity threshold (1 - distance); balances false merge vs over-split on screenpipe-shaped evals
+    // Cosine similarity (1 - distance); balances false merge vs over-split on
+    // screenpipe-shaped evals. 0.35 for VoxCeleb CAM++, 0.32 for 3D-Speaker
+    // zh-en CAM++ (same share of other voices let through; patch 25).
+    let search_threshold = 0.32;
 
     embedding_manager
         .search_speaker(embedding.clone(), search_threshold)
