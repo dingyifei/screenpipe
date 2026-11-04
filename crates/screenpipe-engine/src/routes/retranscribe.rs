@@ -199,11 +199,37 @@ fn is_only_non_latin(text: &str) -> bool {
     text.chars().any(char::is_alphabetic) && !has_latin_letters(text)
 }
 
-/// The pinned-language pass answered wholly outside Latin script while the
+/// Lines of one device remembered to tell English talk from Mandarin talk.
+const SCRIPT_LEAN_LINES: usize = 20;
+/// Fewer remembered lines than this lean nowhere.
+const SCRIPT_LEAN_MIN_LINES: usize = 8;
+
+/// Most of the device's recent lines are wholly Latin script: the talk is in
+/// English, so Chinese in a short line is more likely the pin translating than
+/// someone speaking it.
+fn english_leaning(recent_latin_only: &std::collections::VecDeque<bool>) -> bool {
+    recent_latin_only.len() >= SCRIPT_LEAN_MIN_LINES
+        && recent_latin_only.iter().filter(|latin| **latin).count() * 2 > recent_latin_only.len()
+}
+
+/// Any letter outside Latin script (e.g. one Chinese character).
+fn has_non_latin_letters(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_alphabetic() && !c.is_ascii_alphabetic())
+}
+
+/// The pinned-language pass put non-Latin script into its answer while the
 /// unpinned pass, on the same audio, answered wholly in Latin script: the pin
-/// translated speech that was in the other language.
+/// translated speech that was in the other language. Often only part of it:
+/// "So I would." comes back as "所以，我。" and "I found some." as "我 found
+/// some.", so any Chinese in the pinned answer counts, not only all-Chinese.
+/// Mandarin with English in between ("有个solution") is the same shape, and the
+/// unpinned pass renders it all in English ("The solution."), so the caller
+/// asks about a part-Chinese line only when the talk around it is English;
+/// in Mandarin talk only an all-Chinese line is asked about. Checked
+/// 2026-11-04: 20 of 60 short English lines fixed, 0 of 34 Mandarin changed.
 fn pinned_language_flipped(pinned: &str, unpinned: &str) -> bool {
-    is_only_non_latin(pinned)
+    has_non_latin_letters(pinned)
         && has_latin_letters(unpinned)
         && !unpinned
             .chars()
@@ -862,6 +888,7 @@ async fn transcribe_speaker_segments(
     chunk: &AudioChunkInfo,
     mut recent: Option<&mut Vec<i64>>,
     sung: Option<&[(f64, f64)]>,
+    script_lean: &mut std::collections::VecDeque<bool>,
 ) -> Option<Vec<RetranscribeSegmentResult>> {
     let resampled;
     let samples_16k: &[f32] = if sample_rate == 16000 {
@@ -1028,13 +1055,17 @@ async fn transcribe_speaker_segments(
         }
         let duration = (segment.end - segment.start).max(0.0);
         // A pinned language keeps a long mixed-language chunk from being
-        // translated, but on a short segment it does the translating itself:
-        // "good enough" comes back as "够了". When a short segment comes back
-        // entirely in non-Latin script, ask again without the pin and keep that
-        // answer if it is entirely Latin, i.e. the two disagree on the language.
-        let text = match unpinned_session.as_deref_mut() {
-            Some(unpinned) if duration < UNPINNED_RECHECK_MAX_SECS && is_only_non_latin(&text) => {
-                match unpinned
+        // translated, but on a short segment it does the translating itself,
+        // wholly ("good enough" -> "够了") or in part ("我 found some"). When a
+        // short segment comes back all in non-Latin script, or with any of it
+        // while the talk around it is English, ask again without the pin and
+        // keep that answer if it is entirely Latin, i.e. the two disagree on
+        // the language.
+        let suspect = is_only_non_latin(&text)
+            || (english_leaning(script_lean) && has_non_latin_letters(&text));
+        let text =
+            match unpinned_session.as_deref_mut() {
+                Some(unpinned) if duration < UNPINNED_RECHECK_MAX_SECS && suspect => match unpinned
                     .transcribe(&segment.samples, segment.sample_rate, device_name)
                     .await
                 {
@@ -1042,15 +1073,18 @@ async fn transcribe_speaker_segments(
                         second.trim().to_string()
                     }
                     _ => text,
-                }
-            }
-            _ => text,
-        };
+                },
+                _ => text,
+            };
         // A sub-second segment that is nothing but a filler is almost always
         // the model answering noise or a breath, not a word worth a row.
         if duration < FILLER_ONLY_MAX_SECS && is_filler_only(&text) {
             continue;
         }
+        if script_lean.len() == SCRIPT_LEAN_LINES {
+            script_lean.pop_front();
+        }
+        script_lean.push_back(!has_non_latin_letters(&text));
         // Two microphones in one room each record every sentence. When another
         // mic has this stretch as the same sound, louder, and its words there
         // cover these, this segment is that sentence again: the louder mic
@@ -1512,6 +1546,9 @@ pub async fn retranscribe_handler(
     // Deduplicate chunks by ID (multiple transcription rows per chunk)
     let mut seen_ids = std::collections::HashSet::new();
     let mut other_mic_cache = std::collections::VecDeque::new();
+    // Per device: were its recent lines wholly Latin script (see english_leaning).
+    let mut script_leans: std::collections::HashMap<String, std::collections::VecDeque<bool>> =
+        Default::default();
     // Files inside a session from the live page keep singing (`sung_voice`),
     // whoever asks: the page, a rebuild or the nightly job, so none of them
     // undoes another. Only with speakers, which is how all three ask.
@@ -1620,6 +1657,7 @@ pub async fn retranscribe_handler(
                 chunk,
                 recent_speakers.as_mut(),
                 sung.as_deref(),
+                script_leans.entry(device_name.to_string()).or_default(),
             )
             .await
             {
@@ -2254,9 +2292,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pinned_language_flip_is_detected_only_on_a_full_script_swap() {
+    fn pinned_language_flip_is_any_chinese_against_all_latin() {
         // The pin translated English speech: take the unpinned answer.
         assert!(pinned_language_flipped("够了。", "Good enough."));
+        // ...or translated part of it (session 75, 2026-10-29).
+        assert!(pinned_language_flipped("我 found some.", "I found some."));
+        assert!(pinned_language_flipped("所以，我。", "So I would."));
+        assert!(pinned_language_flipped(
+            "Darth，Vader是像个。",
+            "Our thing is like a."
+        ));
+        assert!(is_only_non_latin("所以，我。"));
+        assert!(!is_only_non_latin("我 found some."));
+        // English the pin left alone is never re-asked.
+        assert!(!has_non_latin_letters(
+            "Like my implementation, which is like."
+        ));
         assert!(pinned_language_flipped(
             "同源重组。",
             "Homologous recombination."
@@ -2266,20 +2317,38 @@ mod tests {
             "还不错，还能识别。",
             "还不错，还能识别。"
         ));
-        // Mixed speech the pin kept as spoken: not a flip, never re-asked.
-        assert!(!is_only_non_latin("这个 feature 还需要 review"));
+        // Mixed speech the unpinned pass also keeps mixed: the pinned text stays.
         assert!(!pinned_language_flipped(
             "这个 feature 还需要 review",
-            "This feature needs review"
+            "这个 feature 还需要 review"
         ));
+        // Same shape as a part-translation, so the caller only asks about a
+        // part-Chinese line when the talk around it is English.
+        assert!(pinned_language_flipped("有个solution。", "The solution."));
         // Unpinned answer still has Chinese in it: keep the pinned text.
         assert!(!pinned_language_flipped(
             "现在测试中文识别。",
             "Sure. 现在测试中文识别。"
         ));
         // Punctuation or digits only is not "non-Latin text".
-        assert!(!is_only_non_latin("。"));
-        assert!(!is_only_non_latin("123"));
+        assert!(!has_non_latin_letters("。"));
+        assert!(!has_non_latin_letters("123"));
+    }
+
+    #[test]
+    fn the_talk_leans_english_only_on_enough_mostly_latin_lines() {
+        use std::collections::VecDeque;
+        let lean = |latin: usize, other: usize| {
+            english_leaning(&VecDeque::from(
+                [vec![true; latin], vec![false; other]].concat(),
+            ))
+        };
+        assert!(!lean(0, 0)); // nothing heard yet: Mandarin rules
+        assert!(!lean(7, 0)); // too few lines
+        assert!(lean(8, 0));
+        assert!(lean(11, 9)); // session 75: two thirds of its lines English
+        assert!(!lean(10, 10)); // an even split is not English talk
+        assert!(!lean(1, 12)); // Mandarin with an English line in between
     }
 
     #[test]
