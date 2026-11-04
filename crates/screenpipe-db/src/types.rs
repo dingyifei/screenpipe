@@ -80,6 +80,54 @@ pub struct SpeakerReassignment {
     pub old_segment_assignments: Vec<(i64, i64)>,
 }
 
+/// A merge as it was done: its log entry, and how many samples came along.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpeakerMergeOutcome {
+    /// The entry in the merge log, for [`DatabaseManager::unmerge_speakers`].
+    pub merge_id: i64,
+    pub samples_moved: u64,
+    pub samples_dropped: u64,
+}
+
+/// One merge in the log.
+#[derive(Debug, Clone, Serialize, Deserialize, OaSchema)]
+pub struct SpeakerMergeEntry {
+    pub id: i64,
+    /// When the merge was made (RFC 3339, UTC).
+    pub created_at: String,
+    pub kept_id: i64,
+    pub merged_id: i64,
+    /// The merged speaker's name at the time; `None` for an unnamed voice.
+    pub merged_name: Option<String>,
+    /// Transcript lines that moved.
+    pub lines: i64,
+    pub undone: bool,
+}
+
+/// What undoing a merge put back.
+#[derive(Debug, Clone, Default)]
+pub struct SpeakerUnmerge {
+    pub kept_id: i64,
+    pub merged_id: i64,
+    /// Lines that are the merged speaker's again.
+    pub lines_restored: u64,
+    /// Lines of the merge that have since been given to somebody else; they stay.
+    pub lines_left: u64,
+    pub samples_restored: u64,
+    /// `(audio_chunk_id, start_time, end_time)` of every restored line, so a
+    /// page can relabel what it saved.
+    pub restored_lines: Vec<(i64, f64, f64)>,
+}
+
+/// Where moved lines go.
+#[derive(Debug, Clone)]
+pub enum LineTarget {
+    /// A speaker that exists.
+    Speaker(i64),
+    /// A new speaker with this name; an empty name makes an unnamed voice of today.
+    New(String),
+}
+
 /// Audio chunk that has no corresponding transcription row.
 /// Used by the reconciliation sweep to detect and retry orphaned chunks.
 #[derive(Debug, Clone, FromRow)]
