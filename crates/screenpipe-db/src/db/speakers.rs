@@ -1042,6 +1042,15 @@ impl DatabaseManager {
         else {
             return Err(SqlxError::RowNotFound);
         };
+        // Rows only ever go back to a merged speaker from the kept one.
+        let kept_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM speakers WHERE id = ?1)")
+                .bind(kept_id)
+                .fetch_one(&mut **tx.conn())
+                .await?;
+        if !kept_exists {
+            return Err(SqlxError::RowNotFound);
+        }
         let refs: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&refs).map_err(|e| SqlxError::Decode(Box::new(e)))?;
         let ids_of = |table: &str| {
@@ -1123,7 +1132,11 @@ impl DatabaseManager {
                 .execute(&mut **tx.conn())
                 .await?;
         }
-        sqlx::query("UPDATE speaker_merge_log SET undone_at = ?2 WHERE id = ?1")
+        // Done: the entry stays as history, without copies of either voice.
+        sqlx::query(
+            "UPDATE speaker_merge_log SET undone_at = ?2, merged_centroid = NULL, kept_centroid = NULL
+             WHERE id = ?1",
+        )
             .bind(merge_id)
             .bind(Utc::now().to_rfc3339())
             .execute(&mut **tx.conn())
@@ -1523,6 +1536,21 @@ impl DatabaseManager {
 
     pub async fn delete_speaker(&self, id: i64) -> Result<(), sqlx::Error> {
         let mut tx = self.begin_immediate_with_retry().await?;
+
+        // A deleted voice must not live on in the merge log (its name, its
+        // samples) or come back through an unmerge.
+        ensure_merge_log(tx.conn()).await?;
+        sqlx::query(
+            "DELETE FROM speaker_merge_log_samples WHERE merge_id IN
+                 (SELECT id FROM speaker_merge_log WHERE kept_id = ?1 OR merged_id = ?1)",
+        )
+        .bind(id)
+        .execute(&mut **tx.conn())
+        .await?;
+        sqlx::query("DELETE FROM speaker_merge_log WHERE kept_id = ?1 OR merged_id = ?1")
+            .bind(id)
+            .execute(&mut **tx.conn())
+            .await?;
 
         // Collect candidate chunk IDs before deleting transcriptions
         let candidate_chunk_ids: Vec<(i64,)> = sqlx::query_as(

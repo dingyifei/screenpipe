@@ -3415,4 +3415,22 @@ mod tests {
             0
         );
     }
+
+    #[tokio::test]
+    async fn deleting_a_speaker_clears_its_merges() {
+        let db = setup_test_db().await;
+        let me = db.insert_speaker(&voice_at(0.0)).await.unwrap();
+        let bob = db.insert_speaker(&voice_at(120.0)).await.unwrap();
+        db.update_speaker_name(bob.id, "Bob").await.unwrap();
+        let merged = db.merge_speakers_logged(me.id, bob.id).await.unwrap();
+        db.delete_speaker(me.id).await.unwrap();
+        assert!(db.list_speaker_merges(None, 10).await.unwrap().is_empty());
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM speaker_merge_log_samples")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+        assert!(db.unmerge_speakers(merged.merge_id).await.is_err());
+        assert!(db.get_speaker_by_id(bob.id).await.is_err());
+    }
 }

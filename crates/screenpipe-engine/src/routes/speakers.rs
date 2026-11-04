@@ -887,7 +887,7 @@ pub(crate) async fn unmerge_speakers_handler(
         }))),
         Err(sqlx::Error::RowNotFound) => Err((
             StatusCode::NOT_FOUND,
-            JsonResponse(json!({"error": "no such merge, or it was already undone"})),
+            JsonResponse(json!({"error": "no such merge, it was already undone, or the speaker it was merged into is gone"})),
         )),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, JsonResponse(json!({"error": e.to_string()})))),
     }
