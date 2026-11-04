@@ -2432,6 +2432,17 @@ pub enum AudioCommand {
         #[arg(short, long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
     },
+    /// Learn every stored speaker voice again with the current voice model
+    /// (after the model changed). Run with the recorder stopped; the recorder
+    /// also does it at start when it finds another model's voices.
+    ReembedSpeakers {
+        /// Run even if a screenpipe server answers on port 3030
+        #[arg(long)]
+        force: bool,
+        /// Only say whether the stored voices are another model's
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]

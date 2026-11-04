@@ -1093,6 +1093,19 @@ async fn main() -> anyhow::Result<()> {
     let notify_failure = database_failure.clone();
     db.set_persistent_failure_hook(Arc::new(move || notify_failure.notify_one()));
 
+    // Fork patch 25: stored voices made by another voice model cannot be
+    // compared with this one's, so learn them again before audio starts.
+    match screenpipe_engine::speaker_reembed::voices_need_reembed(&db).await {
+        Ok(true) => {
+            warn!("stored speaker voices are another model's: learning them again before audio starts");
+            if let Err(e) = screenpipe_engine::speaker_reembed::reembed_speakers(&db, |_, _| {}).await {
+                error!("learning speaker voices again failed; speaker matching is unreliable until `screenpipe audio reembed-speakers` succeeds: {e:#}");
+            }
+        }
+        Ok(false) => {}
+        Err(e) => warn!("could not read which model made the stored speaker voices: {e:#}"),
+    }
+
     // Start sleep/wake monitor for telemetry (macOS only)
     // This tracks sleep/wake events and checks if recording is degraded after wake
     // NOTE: must be started AFTER database init — the monitor spawns background

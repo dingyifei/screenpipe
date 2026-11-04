@@ -24,6 +24,18 @@ static SEGMENTATION_MODEL_PATH: Mutex<Option<PathBuf>> = Mutex::const_new(None);
 static EMBEDDING_MODEL_PATH: Mutex<Option<PathBuf>> = Mutex::const_new(None);
 
 static SEGMENTATION_DOWNLOADING: AtomicBool = AtomicBool::new(false);
+
+/// The voice model (fork patch 25): 3D-Speaker's CAM++ trained on 200k
+/// Mandarin and English speakers, in place of wespeaker's VoxCeleb (English)
+/// CAM++. On in-room meetings it halves the voice confusion on Mandarin
+/// (AliMeeting EER 8.75% -> 3.40%) and ties on English (AMI 8.51% -> 8.37%);
+/// `tools/voice-tracks/bench/embed.py`. Stored voices made by another model
+/// cannot be compared with its vectors, so this id is recorded with them and
+/// `screenpipe audio reembed-speakers` redoes them when it changes.
+pub const VOICE_MODEL_ID: &str = "3dspeaker_campplus_sv_zh_en_16k-common_advanced";
+pub const VOICE_MODEL_FILENAME: &str =
+    "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
+const VOICE_MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
 static EMBEDDING_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
@@ -131,8 +143,8 @@ fn model_state(
             &SEGMENTATION_DOWNLOADING,
         ),
         PyannoteModel::Embedding => (
-            "https://github.com/screenpipe/screenpipe/raw/refs/heads/main/crates/screenpipe-audio/models/pyannote/wespeaker_en_voxceleb_CAM++.onnx",
-            "wespeaker_en_voxceleb_CAM++.onnx",
+            VOICE_MODEL_URL,
+            VOICE_MODEL_FILENAME,
             &EMBEDDING_MODEL_PATH,
             &EMBEDDING_DOWNLOADING,
         ),
@@ -197,8 +209,8 @@ mod tests {
         let (emb_url, emb_filename, ..) = model_state(PyannoteModel::Embedding);
 
         assert_eq!(seg_filename, "segmentation-3.0.onnx");
-        assert_eq!(emb_filename, "wespeaker_en_voxceleb_CAM++.onnx");
+        assert_eq!(emb_filename, VOICE_MODEL_FILENAME);
         assert!(seg_url.contains("segmentation-3.0.onnx"));
-        assert!(emb_url.contains("wespeaker_en_voxceleb_CAM++.onnx"));
+        assert!(emb_url.ends_with(VOICE_MODEL_FILENAME));
     }
 }

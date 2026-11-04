@@ -92,6 +92,7 @@ mod semantic_worker;
 pub mod server;
 pub mod sleep_monitor;
 pub mod snapshot_compaction;
+pub mod speaker_reembed;
 pub mod structured_outputs;
 mod sync_api;
 pub mod sync_provider;

@@ -19,8 +19,9 @@ pub const GROUP_PIECE_SECS: f64 = 1.0;
 /// on the group, not on any one piece; but a lone scrap counted as a voice
 /// founded a speaker that then drew in short pieces of everybody.
 pub const GROUP_VOICE_SECS: f64 = 4.0;
-/// Two samples of one voice are within this cosine distance.
-pub const SAME_VOICE_MAX_DISTANCE: f32 = 0.6;
+/// Two samples of one voice are within this cosine distance (0.6 for
+/// VoxCeleb CAM++; patch 25 moved it with the model, see `speakers.rs`).
+pub const SAME_VOICE_MAX_DISTANCE: f32 = 0.63;
 /// A piece with no speaker of its own belongs to the speech this close to it
 /// in time.
 pub const NEIGHBOUR_GAP_SECS: f64 = 1.5;

@@ -2000,8 +2000,8 @@ mod tests {
     async fn a_speaker_already_heard_is_matched_at_the_looser_limit() {
         let db = setup_test_db().await;
         let narrator = db.insert_speaker(&voice_at(0.0)).await.unwrap();
-        // 66 degrees away is a distance of about 0.59: past the general limit
-        // (0.55), inside the one for a voice of the same conversation (0.62).
+        // 66 degrees away is a distance of 0.593: just past the general limit
+        // (0.59), inside the one for a voice of the same conversation (0.65).
         let later = voice_at(66.0);
         assert!(matches!(
             db.match_speaker_from_embedding(&later).await.unwrap(),
@@ -2124,19 +2124,20 @@ mod tests {
     #[tokio::test]
     async fn a_recent_voice_is_not_hidden_behind_others_past_their_limit() {
         let db = setup_test_db().await;
-        // Seven named voices 0.56 to 0.61 from the probe: past the general
-        // limit, so none of them is a match.
+        // Seven named voices 0.60 to 0.63 from the probe: past the general
+        // limit (0.59), so none of them is a match.
         for step in 0..7 {
             let other = db
-                .insert_speaker(&voice_at(64.0 + step as f32 * 0.45))
+                .insert_speaker(&voice_at(66.5 + step as f32 * 0.3))
                 .await
                 .unwrap();
             db.update_speaker_name(other.id, &format!("Other {step}"))
                 .await
                 .unwrap();
         }
-        // A voice of this conversation a little further still, inside the looser limit.
-        let recent = db.insert_speaker(&voice_at(67.3)).await.unwrap();
+        // A voice of this conversation a little further still (0.64), inside
+        // the looser limit (0.65).
+        let recent = db.insert_speaker(&voice_at(68.8)).await.unwrap();
         db.update_speaker_name(recent.id, "Recent").await.unwrap();
         let probe = voice_at(0.0);
         match db

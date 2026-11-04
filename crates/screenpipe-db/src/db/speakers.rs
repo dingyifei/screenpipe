@@ -33,13 +33,17 @@ const SPEAKER_REF_TABLES: [&str; 5] = [
 
 /// Existing distance threshold, now paired with a runner-up margin so an
 /// embedding close to two profiles does not arbitrarily mutate either one.
-const SPEAKER_MATCH_MAX_DISTANCE: f32 = 0.55;
+/// The limits here and in `voice_groups`/`segment` were set for VoxCeleb CAM++
+/// (0.55, 0.62, 0.6, 0.65) and moved for 3D-Speaker zh-en CAM++ (patch 25) to
+/// the values that let the same share of other voices through on AliMeeting +
+/// AMI (`tools/voice-tracks/bench/embed.py --calibrate`).
+const SPEAKER_MATCH_MAX_DISTANCE: f32 = 0.59;
 const SPEAKER_MATCH_MIN_MARGIN: f32 = 0.08;
 /// The limit for a voice already heard in the conversation being processed,
 /// and for samples a merge may carry over. One voice measured up to 0.6 from
 /// its own earlier sentences and different voices 0.7 and up, on whole
 /// sentences; the general limit above cuts one narrator into several speakers.
-pub const SPEAKER_MATCH_RECENT_MAX_DISTANCE: f32 = 0.62;
+pub const SPEAKER_MATCH_RECENT_MAX_DISTANCE: f32 = 0.65;
 /// How many voice samples a speaker keeps.
 pub const SPEAKER_MAX_STORED_EMBEDDINGS: usize = 10;
 
@@ -160,6 +164,19 @@ async fn delete_speaker_if_unreferenced(
 /// The merge log lives beside the schema, not in it: created here on first
 /// use instead of by a migration, because the npm CLI opens this database too
 /// and refuses one that has run a migration it does not know.
+async fn ensure_voice_model_table(conn: &mut sqlx::SqliteConnection) -> Result<(), SqlxError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS speaker_voice_model (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             model TEXT NOT NULL,
+             set_at TEXT NOT NULL
+         )",
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 async fn ensure_merge_log(conn: &mut sqlx::SqliteConnection) -> Result<(), SqlxError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS speaker_merge_log (
@@ -1366,6 +1383,117 @@ impl DatabaseManager {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Which voice model made the stored voice samples and centres, or `None`
+    /// before patch 25 recorded it (VoxCeleb CAM++). Vectors of different
+    /// models cannot be compared; see `screenpipe audio reembed-speakers`.
+    /// The one-row table is made on first use, not by a migration, so the npm
+    /// CLI still opens the database.
+    pub async fn speaker_voice_model(&self) -> Result<Option<String>, sqlx::Error> {
+        // The read pool is query_only: look for the table, never make it here.
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'speaker_voice_model')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !exists {
+            return Ok(None);
+        }
+        sqlx::query_scalar("SELECT model FROM speaker_voice_model WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    pub async fn set_speaker_voice_model(&self, model: &str) -> Result<(), sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        ensure_voice_model_table(tx.conn()).await?;
+        sqlx::query(
+            "INSERT INTO speaker_voice_model (id, model, set_at) VALUES (1, ?1, datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET model = excluded.model, set_at = excluded.set_at",
+        )
+        .bind(model)
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Every speaker with a stored voice, in the order a re-embed should take
+    /// them: named first, then the newest. `(id, named, day)`.
+    pub async fn speakers_to_reembed(&self) -> Result<Vec<(i64, bool, Option<String>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT s.id, (s.name IS NOT NULL AND s.name != '') AS named,
+                    json_extract(s.metadata, '$.day') AS day
+             FROM speakers s
+             WHERE COALESCE(s.hallucination, 0) = 0
+               AND (s.centroid IS NOT NULL
+                    OR EXISTS (SELECT 1 FROM speaker_embeddings e WHERE e.speaker_id = s.id))
+             ORDER BY named DESC, s.id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// The lines a speaker's voice can be learned again from: their longest
+    /// lines of at least `min_secs` whose audio is still on disk (not evicted),
+    /// at most `limit`. `(chunk id, file, start, end)`.
+    pub async fn speaker_voice_sources(
+        &self,
+        speaker_id: i64,
+        min_secs: f64,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, f64, f64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT t.audio_chunk_id, c.file_path, t.start_time, t.end_time
+             FROM audio_transcriptions t JOIN audio_chunks c ON c.id = t.audio_chunk_id
+             WHERE t.speaker_id = ?1 AND t.end_time - t.start_time >= ?2
+               AND c.evicted_at IS NULL AND c.file_path IS NOT NULL
+             ORDER BY t.end_time - t.start_time DESC
+             LIMIT ?3",
+        )
+        .bind(speaker_id)
+        .bind(min_secs)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Drop a speaker's stored voice (samples and centre): what is left of a
+    /// voice no audio can teach again. Lines and name stay; the speaker no
+    /// longer matches anything until it learns a voice anew.
+    pub async fn clear_speaker_voice(&self, speaker_id: i64) -> Result<(), sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query("DELETE FROM speaker_embeddings WHERE speaker_id = ?1")
+            .bind(speaker_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        sqlx::query("UPDATE speakers SET centroid = NULL, embedding_count = 0 WHERE id = ?1")
+            .bind(speaker_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Forget the voices the merge log keeps for undo, after a model change
+    /// made them incomparable. An unmerge still gives the lines back; the
+    /// speaker it recreates has no voice until one is learned from them.
+    pub async fn forget_merge_log_voices(&self) -> Result<u64, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        ensure_merge_log(tx.conn()).await?;
+        let dropped = sqlx::query("DELETE FROM speaker_merge_log_samples")
+            .execute(&mut **tx.conn())
+            .await?
+            .rows_affected();
+        sqlx::query(
+            "UPDATE speaker_merge_log SET merged_centroid = NULL, merged_embedding_count = 0,
+                 kept_centroid = NULL, kept_took_voice = 0",
+        )
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(dropped)
     }
 
     /// Add `embeddings` to a speaker's stored voice without touching what is
