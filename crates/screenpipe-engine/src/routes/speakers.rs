@@ -10,7 +10,7 @@ use axum::{
 };
 use oasgen::{oasgen, OaSchema};
 
-use screenpipe_db::{ReassignScope, Speaker};
+use screenpipe_db::{LineTarget, ReassignScope, Speaker, SpeakerMergeEntry};
 
 use super::search::{default_speaker_ids, from_comma_separated_array};
 use crate::server::AppState;
@@ -491,7 +491,7 @@ pub(crate) async fn merge_speakers_handler(
 
     let merged = state
         .db
-        .merge_speakers_keeping_voice(speaker_to_keep_id, speaker_to_merge_id)
+        .merge_speakers_logged(speaker_to_keep_id, speaker_to_merge_id)
         .await;
     if merged.is_ok() {
         // A session in progress may be labelling a voice as the merged speaker.
@@ -509,11 +509,13 @@ pub(crate) async fn merge_speakers_handler(
         );
     }
     merged
-        .map(|(samples_moved, samples_dropped)| {
+        .map(|merged| {
             JsonResponse(json!({
                 "success": true,
-                "samples_moved": samples_moved,
-                "samples_dropped": samples_dropped,
+                "samples_moved": merged.samples_moved,
+                "samples_dropped": merged.samples_dropped,
+                // For POST /speakers/unmerge.
+                "merge_id": merged.merge_id,
             }))
         })
         .map_err(|e| {
@@ -836,4 +838,189 @@ pub(crate) async fn undo_speaker_reassign_handler(
         })?;
 
     Ok(JsonResponse(UndoSpeakerReassignResponse { restored }))
+}
+
+// ---- merges that can be undone, and single lines given to someone else (fork) ----
+
+#[derive(OaSchema, Deserialize, Debug)]
+pub(crate) struct ListMergesRequest {
+    /// Merges into or of this speaker; all when absent.
+    speaker_id: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// The merge log, newest first.
+#[oasgen]
+pub(crate) async fn list_speaker_merges_handler(
+    State(state): State<Arc<AppState>>,
+    Query(request): Query<ListMergesRequest>,
+) -> Result<JsonResponse<Vec<SpeakerMergeEntry>>, (StatusCode, JsonResponse<Value>)> {
+    state
+        .db
+        .list_speaker_merges(request.speaker_id, request.limit.unwrap_or(100).clamp(1, 1000))
+        .await
+        .map(JsonResponse)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, JsonResponse(json!({"error": e.to_string()}))))
+}
+
+#[derive(OaSchema, Deserialize, Debug)]
+pub(crate) struct UnmergeRequest {
+    merge_id: i64,
+}
+
+/// Undo a merge: the merged speaker comes back with its lines and voice.
+#[oasgen]
+pub(crate) async fn unmerge_speakers_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<UnmergeRequest>,
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
+    match state.db.unmerge_speakers(request.merge_id).await {
+        Ok(undone) => Ok(JsonResponse(json!({
+            "kept_id": undone.kept_id,
+            "merged_id": undone.merged_id,
+            "lines_restored": undone.lines_restored,
+            "lines_left": undone.lines_left,
+            "samples_restored": undone.samples_restored,
+            "restored_lines": undone.restored_lines.iter()
+                .map(|(chunk, start, end)| json!({"audio_chunk_id": chunk, "start_time": start, "end_time": end}))
+                .collect::<Vec<_>>(),
+        }))),
+        Err(sqlx::Error::RowNotFound) => Err((
+            StatusCode::NOT_FOUND,
+            JsonResponse(json!({"error": "no such merge, or it was already undone"})),
+        )),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, JsonResponse(json!({"error": e.to_string()})))),
+    }
+}
+
+#[derive(OaSchema, Deserialize, Debug)]
+pub(crate) struct MovedLine {
+    audio_chunk_id: i64,
+    start_time: f64,
+    end_time: f64,
+}
+
+#[derive(OaSchema, Deserialize, Debug)]
+pub(crate) struct MoveLinesRequest {
+    lines: Vec<MovedLine>,
+    /// An existing speaker; or else
+    to_speaker_id: Option<i64>,
+    /// a new one by this name (empty: an unnamed voice of today).
+    new_name: Option<String>,
+    /// Teach the target the moved lines' voice and drop the samples of the
+    /// old speaker(s) that sound like it. Default true.
+    relearn: Option<bool>,
+}
+
+/// The least of a line that is worth a voice sample.
+const MOVE_SAMPLE_MIN_SECS: f64 = 1.0;
+/// The least moved speech before the old speaker's samples are pruned.
+const MOVE_PRUNE_MIN_SECS: f64 = 2.0;
+
+/// Give single lines to someone else. The response carries the undo payload
+/// for POST /speakers/undo-reassign (rows only; voices are not put back).
+#[oasgen]
+pub(crate) async fn move_lines_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<MoveLinesRequest>,
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
+    let bad = |status: StatusCode, msg: &str| (status, JsonResponse(json!({"error": msg})));
+    if request.lines.is_empty() || request.lines.len() > 2000 {
+        return Err(bad(StatusCode::BAD_REQUEST, "lines must name 1 to 2000 lines"));
+    }
+    let target = match (request.to_speaker_id, request.new_name) {
+        (Some(id), None) => LineTarget::Speaker(id),
+        (None, Some(name)) => LineTarget::New(name),
+        _ => return Err(bad(StatusCode::BAD_REQUEST, "give to_speaker_id or new_name, not both")),
+    };
+    let keys: Vec<(i64, f64)> = request.lines.iter().map(|l| (l.audio_chunk_id, l.start_time)).collect();
+    let moved = match state.db.move_lines_to_speaker(&keys, target).await {
+        Ok(moved) => moved,
+        Err(sqlx::Error::RowNotFound) => return Err(bad(StatusCode::NOT_FOUND, "no such speaker")),
+        Err(e) => return Err(bad(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    };
+
+    let (mut learned, mut pruned) = (0usize, 0u64);
+    if request.relearn.unwrap_or(true) && moved.transcriptions_updated > 0 {
+        let voices = voices_of_lines(&state, &request.lines).await;
+        let secs: f64 = voices.iter().map(|(s, _)| s).sum();
+        let samples: Vec<Vec<f32>> = voices.into_iter().map(|(_, v)| v).collect();
+        if !samples.is_empty() {
+            let had = state.db.speaker_sample_count(moved.speaker_id).await.unwrap_or(0);
+            learned = if had == 0 {
+                let n = samples.len().min(screenpipe_db::SPEAKER_MAX_STORED_EMBEDDINGS);
+                state.db.replace_speaker_embeddings(moved.speaker_id, &samples).await.map(|_| n).unwrap_or(0)
+            } else {
+                state.db.add_speaker_embeddings(moved.speaker_id, &samples).await.unwrap_or(0)
+            };
+            if secs >= MOVE_PRUNE_MIN_SECS {
+                let refs: Vec<&Vec<f32>> = samples.iter().collect();
+                let centre = mean(&refs);
+                let mut sources: Vec<i64> = moved.old_assignments.iter().map(|(_, s)| *s).collect();
+                sources.sort_unstable();
+                sources.dedup();
+                for source in sources {
+                    pruned += state.db.prune_speaker_samples_toward(source, &centre).await.unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    let wire = |pairs: &[(i64, i64)]| {
+        pairs.iter().map(|(row, sid)| json!({"transcription_id": row, "old_speaker_id": sid})).collect::<Vec<_>>()
+    };
+    Ok(JsonResponse(json!({
+        "speaker_id": moved.speaker_id,
+        "moved": moved.transcriptions_updated,
+        "old_assignments": wire(&moved.old_assignments),
+        "old_segment_assignments": wire(&moved.old_segment_assignments),
+        "samples_learned": learned,
+        "samples_pruned": pruned,
+    })))
+}
+
+fn mean(vectors: &[&Vec<f32>]) -> Vec<f32> {
+    let mut out = vec![0f32; vectors.first().map_or(0, |v| v.len())];
+    for v in vectors {
+        for (m, x) in out.iter_mut().zip(v.iter()) {
+            *m += x / vectors.len() as f32;
+        }
+    }
+    out
+}
+
+/// A voice sample of each line long enough to give one: (seconds, sample).
+async fn voices_of_lines(state: &Arc<AppState>, lines: &[MovedLine]) -> Vec<(f64, Vec<f32>)> {
+    let mut ids: Vec<i64> = lines.iter().map(|l| l.audio_chunk_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let Ok(chunks) = state.db.get_audio_chunks_by_ids(&ids).await else {
+        return Vec::new();
+    };
+    let files: std::collections::HashMap<i64, String> = chunks.into_iter().map(|c| (c.id, c.file_path)).collect();
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(file) = files.get(&id) else { continue };
+        let Ok((samples, rate)) = screenpipe_audio::utils::ffmpeg::read_audio_from_file(Path::new(file)) else {
+            continue;
+        };
+        let Ok(samples) = (if rate == 16000 { Ok(samples) } else { screenpipe_audio::resample(&samples, rate, 16000) }) else {
+            continue;
+        };
+        for line in lines.iter().filter(|l| l.audio_chunk_id == id) {
+            let secs = line.end_time - line.start_time;
+            if secs < MOVE_SAMPLE_MIN_SECS {
+                continue;
+            }
+            let from = ((line.start_time.max(0.0)) * 16000.0) as usize;
+            let to = ((line.end_time * 16000.0) as usize).min(samples.len());
+            if to <= from {
+                continue;
+            }
+            if let Some(voice) = state.audio_manager.voice_embedding(&samples[from..to]).await {
+                out.push((secs, voice));
+            }
+        }
+    }
+    out
 }

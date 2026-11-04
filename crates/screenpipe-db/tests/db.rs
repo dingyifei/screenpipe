@@ -3222,4 +3222,197 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0, "Should count 0 for non-matching query");
     }
+
+    // ---- merges that can be undone, and lines that can be moved (fork) ----
+
+    fn mic() -> AudioDevice {
+        AudioDevice {
+            name: "mic".to_string(),
+            device_type: DeviceType::Input,
+        }
+    }
+
+    /// Lines of one chunk, each `(start, speaker)`, two seconds long.
+    async fn lines(db: &DatabaseManager, chunk: i64, of: &[(f64, i64)]) {
+        for (i, (start, speaker)) in of.iter().enumerate() {
+            db.insert_audio_transcription(
+                chunk,
+                &format!("line {i} at {start}"),
+                i as i64,
+                "test",
+                &mic(),
+                Some(*speaker),
+                Some(*start),
+                Some(start + 2.0),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn speaker_of(db: &DatabaseManager, chunk: i64, start: f64) -> Option<i64> {
+        sqlx::query_scalar(
+            "SELECT speaker_id FROM audio_transcriptions WHERE audio_chunk_id = ?1 AND start_time = ?2",
+        )
+        .bind(chunk)
+        .bind(start)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_undone_merge_gives_the_speaker_back_its_lines_and_voice() {
+        let db = setup_test_db().await;
+        let me = db.insert_speaker(&voice_at(0.0)).await.unwrap();
+        db.update_speaker_name(me.id, "Me").await.unwrap();
+        let bob = db.insert_speaker(&voice_at(30.0)).await.unwrap();
+        db.update_speaker_name(bob.id, "Bob").await.unwrap();
+        db.add_embedding_to_speaker(bob.id, &voice_at(120.0), 10)
+            .await
+            .unwrap();
+        let chunk = db.insert_audio_chunk("s.mp4", None).await.unwrap();
+        lines(&db, chunk, &[(0.0, me.id), (3.0, bob.id), (6.0, bob.id)]).await;
+
+        let merged = db.merge_speakers_logged(me.id, bob.id).await.unwrap();
+        assert_eq!((merged.samples_moved, merged.samples_dropped), (1, 1));
+        assert_eq!(speaker_of(&db, chunk, 3.0).await, Some(me.id));
+        assert!(db.get_speaker_by_id(bob.id).await.is_err());
+
+        let log = db.list_speaker_merges(Some(me.id), 10).await.unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].merged_id, bob.id);
+        assert_eq!(log[0].merged_name.as_deref(), Some("Bob"));
+        assert_eq!(log[0].lines, 2);
+        assert!(!log[0].undone);
+
+        let undone = db.unmerge_speakers(merged.merge_id).await.unwrap();
+        assert_eq!((undone.kept_id, undone.merged_id), (me.id, bob.id));
+        assert_eq!((undone.lines_restored, undone.lines_left), (2, 0));
+        assert_eq!(undone.restored_lines.len(), 2);
+        assert_eq!(db.get_speaker_by_id(bob.id).await.unwrap().name, "Bob");
+        assert_eq!(speaker_of(&db, chunk, 0.0).await, Some(me.id));
+        assert_eq!(speaker_of(&db, chunk, 3.0).await, Some(bob.id));
+        assert_eq!(speaker_of(&db, chunk, 6.0).await, Some(bob.id));
+        // Both of Bob's samples are his again, the one Me took and the one dropped.
+        assert_eq!(sample_count(&db, bob.id).await, 2);
+        assert_eq!(sample_count(&db, me.id).await, 1);
+        // Done once only.
+        assert!(db.unmerge_speakers(merged.merge_id).await.is_err());
+        assert!(db.list_speaker_merges(Some(me.id), 10).await.unwrap()[0].undone);
+    }
+
+    #[tokio::test]
+    async fn an_unmerge_leaves_lines_moved_since_where_they_are() {
+        let db = setup_test_db().await;
+        let me = db.insert_speaker(&voice_at(0.0)).await.unwrap();
+        let bob = db.insert_speaker(&voice_at(90.0)).await.unwrap();
+        let chunk = db.insert_audio_chunk("s.mp4", None).await.unwrap();
+        lines(&db, chunk, &[(0.0, bob.id), (3.0, bob.id)]).await;
+        let merged = db.merge_speakers_logged(me.id, bob.id).await.unwrap();
+        let carol = db
+            .move_lines_to_speaker(&[(chunk, 3.0)], screenpipe_db::LineTarget::New("Carol".into()))
+            .await
+            .unwrap();
+
+        let undone = db.unmerge_speakers(merged.merge_id).await.unwrap();
+        assert_eq!((undone.lines_restored, undone.lines_left), (1, 1));
+        assert_eq!(speaker_of(&db, chunk, 0.0).await, Some(bob.id));
+        assert_eq!(speaker_of(&db, chunk, 3.0).await, Some(carol.speaker_id));
+    }
+
+    #[tokio::test]
+    async fn a_kept_speaker_that_took_the_merged_voice_gives_it_back() {
+        let db = setup_test_db().await;
+        let kept = db.insert_speaker(&voice_at(0.0)).await.unwrap();
+        sqlx::query("DELETE FROM speaker_embeddings WHERE speaker_id = ?1")
+            .bind(kept.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE speakers SET centroid = NULL, embedding_count = 0 WHERE id = ?1")
+            .bind(kept.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let other = db.insert_speaker(&voice_at(120.0)).await.unwrap();
+        let merged = db.merge_speakers_logged(kept.id, other.id).await.unwrap();
+        assert_eq!(sample_count(&db, kept.id).await, 1);
+
+        db.unmerge_speakers(merged.merge_id).await.unwrap();
+        assert_eq!(sample_count(&db, kept.id).await, 0);
+        assert_eq!(sample_count(&db, other.id).await, 1);
+        let (centroid, count): (Option<Vec<u8>>, i64) =
+            sqlx::query_as("SELECT centroid, embedding_count FROM speakers WHERE id = ?1")
+                .bind(kept.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!((centroid, count), (None, 0));
+    }
+
+    #[tokio::test]
+    async fn moving_lines_to_a_new_voice_can_be_undone() {
+        let db = setup_test_db().await;
+        let tilt = db.insert_speaker(&voice_at(0.0)).await.unwrap();
+        db.update_speaker_name(tilt.id, "TILT").await.unwrap();
+        let chunk = db.insert_audio_chunk("s.mp4", None).await.unwrap();
+        lines(&db, chunk, &[(0.0, tilt.id), (5.0, tilt.id), (10.0, tilt.id)]).await;
+
+        // A start time read back from JSON may be off in the last digits.
+        let moved = db
+            .move_lines_to_speaker(&[(chunk, 5.0004)], screenpipe_db::LineTarget::New("Student".into()))
+            .await
+            .unwrap();
+        assert_eq!(moved.transcriptions_updated, 1);
+        assert_eq!(db.get_speaker_by_id(moved.speaker_id).await.unwrap().name, "Student");
+        assert_eq!(speaker_of(&db, chunk, 5.0).await, Some(moved.speaker_id));
+        assert_eq!(speaker_of(&db, chunk, 10.0).await, Some(tilt.id));
+        assert_eq!(moved.old_assignments.len(), 1);
+        assert_eq!(moved.old_assignments[0].1, tilt.id);
+
+        // To someone already known, by id.
+        let back = db
+            .move_lines_to_speaker(&[(chunk, 5.0)], screenpipe_db::LineTarget::Speaker(tilt.id))
+            .await
+            .unwrap();
+        assert_eq!(back.speaker_id, tilt.id);
+        db.undo_speaker_reassign(&back.old_assignments, &back.old_segment_assignments)
+            .await
+            .unwrap();
+        assert_eq!(speaker_of(&db, chunk, 5.0).await, Some(moved.speaker_id));
+        // An unknown speaker id is refused, nothing moves.
+        assert!(db
+            .move_lines_to_speaker(&[(chunk, 0.0)], screenpipe_db::LineTarget::Speaker(9_999_999))
+            .await
+            .is_err());
+        assert_eq!(speaker_of(&db, chunk, 0.0).await, Some(tilt.id));
+    }
+
+    #[tokio::test]
+    async fn pruning_drops_only_samples_nearer_the_other_voice() {
+        let db = setup_test_db().await;
+        let tilt = db.insert_speaker(&voice_at(0.0)).await.unwrap();
+        db.add_embedding_to_speaker(tilt.id, &voice_at(5.0), 10)
+            .await
+            .unwrap();
+        db.add_embedding_to_speaker(tilt.id, &voice_at(100.0), 10)
+            .await
+            .unwrap();
+        let dropped = db
+            .prune_speaker_samples_toward(tilt.id, &voice_at(95.0))
+            .await
+            .unwrap();
+        assert_eq!(dropped, 1);
+        assert_eq!(sample_count(&db, tilt.id).await, 2);
+        // Never the last sample: a voice with nothing stored matches nobody.
+        let lone = db.insert_speaker(&voice_at(100.0)).await.unwrap();
+        assert_eq!(
+            db.prune_speaker_samples_toward(lone.id, &voice_at(95.0))
+                .await
+                .unwrap(),
+            0
+        );
+    }
 }

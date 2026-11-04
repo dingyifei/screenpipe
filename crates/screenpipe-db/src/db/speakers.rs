@@ -4,7 +4,10 @@
 
 use super::*;
 use crate::SpeakerEmbeddingMatch;
-use crate::{ReassignScope, SpeakerReassignment};
+use crate::{
+    LineTarget, ReassignScope, SpeakerMergeEntry, SpeakerMergeOutcome, SpeakerReassignment,
+    SpeakerUnmerge,
+};
 use sqlx::AssertSqlSafe;
 
 /// The local calendar day stamped on new unnamed speakers and used to scope
@@ -152,6 +155,74 @@ async fn delete_speaker_if_unreferenced(
         .execute(&mut *conn)
         .await?;
     Ok(true)
+}
+
+/// The merge log lives beside the schema, not in it: created here on first
+/// use instead of by a migration, because the npm CLI opens this database too
+/// and refuses one that has run a migration it does not know.
+async fn ensure_merge_log(conn: &mut sqlx::SqliteConnection) -> Result<(), SqlxError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS speaker_merge_log (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             created_at TEXT NOT NULL,
+             kept_id INTEGER NOT NULL,
+             merged_id INTEGER NOT NULL,
+             merged_name TEXT,
+             merged_metadata TEXT,
+             merged_hallucination BOOLEAN,
+             merged_centroid BLOB,
+             merged_embedding_count INTEGER,
+             kept_centroid BLOB,
+             kept_embedding_count INTEGER,
+             kept_took_voice BOOLEAN NOT NULL DEFAULT FALSE,
+             refs TEXT NOT NULL,
+             undone_at TEXT
+         )",
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS speaker_merge_log_samples (
+             merge_id INTEGER NOT NULL,
+             embedding BLOB NOT NULL
+         )",
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+fn floats_of(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+fn mean_of(vectors: &[&Vec<f32>]) -> Vec<f32> {
+    let Some(first) = vectors.first() else {
+        return Vec::new();
+    };
+    let mut mean = vec![0f32; first.len()];
+    for v in vectors {
+        for (m, x) in mean.iter_mut().zip(v.iter()) {
+            *m += x / vectors.len() as f32;
+        }
+    }
+    mean
+}
+
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 2.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm = a.iter().map(|x| x * x).sum::<f32>().sqrt() * b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        2.0
+    } else {
+        1.0 - dot / norm
+    }
 }
 
 impl DatabaseManager {
@@ -765,13 +836,46 @@ impl DatabaseManager {
     /// ever merged into it, which then matched everybody. A kept speaker with
     /// no samples takes the merged one's as they are.
     ///
-    /// Returns `(samples_moved, samples_dropped)`.
+    /// Returns `(samples_moved, samples_dropped)`. Logged like
+    /// [`Self::merge_speakers_logged`], so it can be undone.
     pub async fn merge_speakers_keeping_voice(
         &self,
         speaker_to_keep_id: i64,
         speaker_to_merge_id: i64,
     ) -> Result<(u64, u64), sqlx::Error> {
+        let merged = self
+            .merge_speakers_logged(speaker_to_keep_id, speaker_to_merge_id)
+            .await?;
+        Ok((merged.samples_moved, merged.samples_dropped))
+    }
+
+    /// [`Self::merge_speakers_keeping_voice`], writing first what it changes
+    /// into the merge log: the merged speaker as it was, every row that
+    /// pointed at it, the samples that move and the ones that are deleted.
+    /// [`Self::unmerge_speakers`] puts that back.
+    pub async fn merge_speakers_logged(
+        &self,
+        speaker_to_keep_id: i64,
+        speaker_to_merge_id: i64,
+    ) -> Result<SpeakerMergeOutcome, sqlx::Error> {
+        if speaker_to_keep_id == speaker_to_merge_id {
+            return Err(SqlxError::Protocol("a speaker cannot be merged into itself".into()));
+        }
         let mut tx = self.begin_immediate_with_retry().await?;
+        ensure_merge_log(tx.conn()).await?;
+
+        type SpeakerRow = (Option<String>, Option<String>, Option<bool>, Option<Vec<u8>>, Option<i64>);
+        let read = "SELECT name, metadata, hallucination, centroid, embedding_count FROM speakers WHERE id = ?1";
+        let merged_row: SpeakerRow = sqlx::query_as(read)
+            .bind(speaker_to_merge_id)
+            .fetch_optional(&mut **tx.conn())
+            .await?
+            .ok_or(SqlxError::RowNotFound)?;
+        let kept_row: SpeakerRow = sqlx::query_as(read)
+            .bind(speaker_to_keep_id)
+            .fetch_optional(&mut **tx.conn())
+            .await?
+            .ok_or(SqlxError::RowNotFound)?;
 
         let kept: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?1")
@@ -811,6 +915,49 @@ impl DatabaseManager {
             .fetch_all(&mut **tx.conn())
             .await?
         };
+        let kept_takes_voice = kept == 0 && !alike.is_empty();
+
+        // The log entry, written before anything moves.
+        let mut refs = serde_json::Map::new();
+        for table in SPEAKER_REF_TABLES {
+            if table == "speaker_embeddings" {
+                continue;
+            }
+            let ids: Vec<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT id FROM {table} WHERE speaker_id = ?1"
+            )))
+            .bind(speaker_to_merge_id)
+            .fetch_all(&mut **tx.conn())
+            .await?;
+            refs.insert(table.to_string(), serde_json::json!(ids));
+        }
+        refs.insert(
+            "speaker_embeddings".to_string(),
+            serde_json::json!(alike.iter().map(|(id,)| *id).collect::<Vec<_>>()),
+        );
+        let merge_id = sqlx::query(
+            "INSERT INTO speaker_merge_log
+                 (created_at, kept_id, merged_id, merged_name, merged_metadata,
+                  merged_hallucination, merged_centroid, merged_embedding_count,
+                  kept_centroid, kept_embedding_count, kept_took_voice, refs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(speaker_to_keep_id)
+        .bind(speaker_to_merge_id)
+        .bind(&merged_row.0)
+        .bind(&merged_row.1)
+        .bind(merged_row.2)
+        .bind(&merged_row.3)
+        .bind(merged_row.4)
+        .bind(&kept_row.3)
+        .bind(kept_row.4)
+        .bind(kept_takes_voice)
+        .bind(serde_json::Value::Object(refs).to_string())
+        .execute(&mut **tx.conn())
+        .await?
+        .last_insert_rowid();
+
         for (id,) in &alike {
             sqlx::query("UPDATE speaker_embeddings SET speaker_id = ?1 WHERE id = ?2")
                 .bind(speaker_to_keep_id)
@@ -818,11 +965,20 @@ impl DatabaseManager {
                 .execute(&mut **tx.conn())
                 .await?;
         }
+        // What stays behind is deleted; the log keeps a copy.
+        sqlx::query(
+            "INSERT INTO speaker_merge_log_samples (merge_id, embedding)
+             SELECT ?1, embedding FROM speaker_embeddings WHERE speaker_id = ?2",
+        )
+        .bind(merge_id)
+        .bind(speaker_to_merge_id)
+        .execute(&mut **tx.conn())
+        .await?;
         sqlx::query("DELETE FROM speaker_embeddings WHERE speaker_id = ?1")
             .bind(speaker_to_merge_id)
             .execute(&mut **tx.conn())
             .await?;
-        if kept == 0 && !alike.is_empty() {
+        if kept_takes_voice {
             // The kept speaker had no voice of its own: it takes the merged one's centre too.
             sqlx::query(
                 "UPDATE speakers SET
@@ -845,7 +1001,312 @@ impl DatabaseManager {
         tx.commit().await?;
 
         let moved = alike.len() as u64;
-        Ok((moved, (offered as u64).saturating_sub(moved)))
+        Ok(SpeakerMergeOutcome {
+            merge_id,
+            samples_moved: moved,
+            samples_dropped: (offered as u64).saturating_sub(moved),
+        })
+    }
+
+    /// Undo a logged merge. The merged speaker comes back under its own id,
+    /// name and day; its lines and other rows return to it where they still
+    /// point at the kept speaker (a line given to somebody else since stays
+    /// there); its samples return, the moved ones and the deleted ones; a kept
+    /// speaker that took its voice gets its own centre back. Once only.
+    pub async fn unmerge_speakers(&self, merge_id: i64) -> Result<SpeakerUnmerge, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        ensure_merge_log(tx.conn()).await?;
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<bool>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            bool,
+            String,
+        )> = sqlx::query_as(
+            "SELECT kept_id, merged_id, merged_name, merged_metadata, merged_hallucination,
+                    merged_centroid, merged_embedding_count, kept_centroid, kept_embedding_count,
+                    kept_took_voice, refs
+             FROM speaker_merge_log WHERE id = ?1 AND undone_at IS NULL",
+        )
+        .bind(merge_id)
+        .fetch_optional(&mut **tx.conn())
+        .await?;
+        let Some((kept_id, merged_id, name, metadata, hallucination, centroid, count, kept_centroid, kept_count, kept_took_voice, refs)) = row
+        else {
+            return Err(SqlxError::RowNotFound);
+        };
+        let refs: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&refs).map_err(|e| SqlxError::Decode(Box::new(e)))?;
+        let ids_of = |table: &str| {
+            refs.get(table)
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]))
+                .to_string()
+        };
+
+        // The speaker first, under its old id: nothing may point at a missing row.
+        sqlx::query(
+            "INSERT INTO speakers (id, name, metadata, hallucination, centroid, embedding_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, metadata = excluded.metadata,
+                 hallucination = excluded.hallucination, centroid = excluded.centroid,
+                 embedding_count = excluded.embedding_count",
+        )
+        .bind(merged_id)
+        .bind(&name)
+        .bind(&metadata)
+        .bind(hallucination)
+        .bind(&centroid)
+        .bind(count)
+        .execute(&mut **tx.conn())
+        .await?;
+
+        let mut outcome = SpeakerUnmerge {
+            kept_id,
+            merged_id,
+            ..Default::default()
+        };
+        outcome.restored_lines = sqlx::query_as(
+            "SELECT audio_chunk_id, COALESCE(start_time, 0), COALESCE(end_time, start_time, 0)
+             FROM audio_transcriptions
+             WHERE speaker_id = ?1 AND id IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(kept_id)
+        .bind(ids_of("audio_transcriptions"))
+        .fetch_all(&mut **tx.conn())
+        .await?;
+        for table in SPEAKER_REF_TABLES {
+            let back = sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {table} SET speaker_id = ?1
+                 WHERE speaker_id = ?2 AND id IN (SELECT value FROM json_each(?3))"
+            )))
+            .bind(merged_id)
+            .bind(kept_id)
+            .bind(ids_of(table))
+            .execute(&mut **tx.conn())
+            .await?
+            .rows_affected();
+            match table {
+                "audio_transcriptions" => {
+                    let logged = refs
+                        .get(table)
+                        .and_then(|v| v.as_array())
+                        .map_or(0, |a| a.len() as u64);
+                    outcome.lines_restored = back;
+                    outcome.lines_left = logged.saturating_sub(back);
+                }
+                "speaker_embeddings" => outcome.samples_restored += back,
+                _ => {}
+            }
+        }
+        outcome.samples_restored += sqlx::query(
+            "INSERT INTO speaker_embeddings (embedding, speaker_id)
+             SELECT embedding, ?2 FROM speaker_merge_log_samples WHERE merge_id = ?1",
+        )
+        .bind(merge_id)
+        .bind(merged_id)
+        .execute(&mut **tx.conn())
+        .await?
+        .rows_affected();
+        if kept_took_voice {
+            sqlx::query("UPDATE speakers SET centroid = ?2, embedding_count = ?3 WHERE id = ?1")
+                .bind(kept_id)
+                .bind(&kept_centroid)
+                .bind(kept_count)
+                .execute(&mut **tx.conn())
+                .await?;
+        }
+        sqlx::query("UPDATE speaker_merge_log SET undone_at = ?2 WHERE id = ?1")
+            .bind(merge_id)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut **tx.conn())
+            .await?;
+        sqlx::query("DELETE FROM speaker_merge_log_samples WHERE merge_id = ?1")
+            .bind(merge_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// How many voice samples a speaker has stored.
+    pub async fn speaker_sample_count(&self, speaker_id: i64) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?1")
+            .bind(speaker_id)
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// The merge log, newest first: merges into or of `speaker_id`, or all.
+    pub async fn list_speaker_merges(
+        &self,
+        speaker_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<SpeakerMergeEntry>, sqlx::Error> {
+        {
+            let mut tx = self.begin_immediate_with_retry().await?;
+            ensure_merge_log(tx.conn()).await?;
+            tx.commit().await?;
+        }
+        let rows: Vec<(i64, String, i64, i64, Option<String>, i64, bool)> = sqlx::query_as(
+            "SELECT id, created_at, kept_id, merged_id, merged_name,
+                    COALESCE(json_array_length(refs, '$.audio_transcriptions'), 0),
+                    undone_at IS NOT NULL
+             FROM speaker_merge_log
+             WHERE ?1 IS NULL OR kept_id = ?1 OR merged_id = ?1
+             ORDER BY id DESC LIMIT ?2",
+        )
+        .bind(speaker_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, created_at, kept_id, merged_id, merged_name, lines, undone)| SpeakerMergeEntry {
+                id,
+                created_at,
+                kept_id,
+                merged_id,
+                merged_name: merged_name.filter(|n| !n.trim().is_empty()),
+                lines,
+                undone,
+            })
+            .collect())
+    }
+
+    /// Give single transcript lines to another speaker: each line is named by
+    /// its file and start time (as a page has them; matched within 10 ms).
+    /// Returns the undo payload in the shape [`Self::undo_speaker_reassign`]
+    /// takes. A line with no speaker yet moves too but cannot be undone back
+    /// to none. Voices are left alone; see [`Self::prune_speaker_samples_toward`].
+    pub async fn move_lines_to_speaker(
+        &self,
+        lines: &[(i64, f64)],
+        target: LineTarget,
+    ) -> Result<SpeakerReassignment, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let speaker_id = match target {
+            LineTarget::Speaker(id) => {
+                let exists: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM speakers WHERE id = ?1)")
+                        .bind(id)
+                        .fetch_one(&mut **tx.conn())
+                        .await?;
+                if !exists {
+                    return Err(SqlxError::RowNotFound);
+                }
+                id
+            }
+            LineTarget::New(name) => {
+                let name = name.trim();
+                sqlx::query(
+                    "INSERT INTO speakers (name, metadata, embedding_count)
+                     VALUES (?1, json_object('day', ?2), 0)",
+                )
+                .bind((!name.is_empty()).then_some(name))
+                .bind(speaker_day_today())
+                .execute(&mut **tx.conn())
+                .await?
+                .last_insert_rowid()
+            }
+        };
+        let mut outcome = SpeakerReassignment {
+            speaker_id,
+            ..Default::default()
+        };
+        for (chunk, start) in lines {
+            let rows: Vec<(i64, Option<i64>)> = sqlx::query_as(
+                "SELECT id, speaker_id FROM audio_transcriptions
+                 WHERE audio_chunk_id = ?1 AND ABS(start_time - ?2) < 0.01",
+            )
+            .bind(chunk)
+            .bind(start)
+            .fetch_all(&mut **tx.conn())
+            .await?;
+            for (id, was) in rows {
+                if was == Some(speaker_id) {
+                    continue;
+                }
+                if let Some(was) = was {
+                    outcome.old_assignments.push((id, was));
+                }
+                sqlx::query("UPDATE audio_transcriptions SET speaker_id = ?1 WHERE id = ?2")
+                    .bind(speaker_id)
+                    .bind(id)
+                    .execute(&mut **tx.conn())
+                    .await?;
+                outcome.transcriptions_updated += 1;
+            }
+        }
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// Drop a speaker's stored samples that sound more like `toward` (another
+    /// person's voice) than like the rest of the speaker's own samples, then
+    /// recompute its centre. What a voice that held two people needs once
+    /// their lines are told apart. Never drops the last sample. Returns how
+    /// many went.
+    pub async fn prune_speaker_samples_toward(
+        &self,
+        speaker_id: i64,
+        toward: &[f32],
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let rows: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT id, embedding FROM speaker_embeddings WHERE speaker_id = ?1")
+                .bind(speaker_id)
+                .fetch_all(&mut **tx.conn())
+                .await?;
+        let samples: Vec<(i64, Vec<f32>)> =
+            rows.into_iter().map(|(id, b)| (id, floats_of(&b))).collect();
+        if samples.len() < 2 {
+            return Ok(0);
+        }
+        // Each sample against the centre of the others, so it does not vote for itself.
+        let mut drop: Vec<i64> = samples
+            .iter()
+            .filter(|(id, v)| {
+                let others: Vec<&Vec<f32>> = samples.iter().filter(|(o, _)| o != id).map(|(_, v)| v).collect();
+                let own = mean_of(&others);
+                cosine_distance(v, toward) < cosine_distance(v, &own)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if drop.len() == samples.len() {
+            // Keep the one least like the other voice.
+            let keep = samples
+                .iter()
+                .max_by(|a, b| cosine_distance(&a.1, toward).total_cmp(&cosine_distance(&b.1, toward)))
+                .map(|(id, _)| *id);
+            drop.retain(|id| Some(*id) != keep);
+        }
+        for id in &drop {
+            sqlx::query("DELETE FROM speaker_embeddings WHERE id = ?1")
+                .bind(id)
+                .execute(&mut **tx.conn())
+                .await?;
+        }
+        if !drop.is_empty() {
+            let left: Vec<&Vec<f32>> = samples.iter().filter(|(id, _)| !drop.contains(id)).map(|(_, v)| v).collect();
+            let centre = mean_of(&left);
+            let bytes: &[u8] = centre.as_bytes();
+            sqlx::query("UPDATE speakers SET centroid = vec_f32(?1), embedding_count = ?2 WHERE id = ?3")
+                .bind(bytes)
+                .bind(left.len() as i64)
+                .bind(speaker_id)
+                .execute(&mut **tx.conn())
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(drop.len() as u64)
     }
 
     /// Replace a speaker's stored voice: its samples become `embeddings` (the
