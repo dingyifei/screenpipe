@@ -39,7 +39,7 @@ const OLD_UNNAMED_SAMPLES: usize = 3;
 const BUSY_ATTEMPTS: u32 = 60;
 const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn patiently<T, F, Fut>(what: &str, mut call: F) -> Result<T>
+pub(crate) async fn patiently<T, F, Fut>(what: &str, mut call: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
