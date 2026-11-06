@@ -1750,16 +1750,21 @@ pub async fn retranscribe_handler(
                         end_time: s.end.max(s.start),
                     })
                     .collect();
-                if let Err(e) = state
-                    .db
-                    .replace_audio_transcriptions(
-                        chunk.id,
-                        &rows,
-                        &engine_name,
-                        device_name,
-                        is_input,
-                        timestamp,
-                    )
+                // The database's maintenance can hold the write slot for
+                // minutes; a write that times out behind it waits and tries
+                // again rather than failing the chunk, which would make the
+                // nightly redo its whole slice (patch 28).
+                if let Err(e) =
+                    crate::speaker_reembed::patiently("replace transcription rows", || {
+                        state.db.replace_audio_transcriptions(
+                            chunk.id,
+                            &rows,
+                            &engine_name,
+                            device_name,
+                            is_input,
+                            timestamp,
+                        )
+                    })
                     .await
                 {
                     error!(
@@ -1801,9 +1806,8 @@ pub async fn retranscribe_handler(
         };
 
         // Update DB — replace all existing transcription rows for this chunk
-        if let Err(e) = state
-            .db
-            .replace_audio_transcription(
+        if let Err(e) = crate::speaker_reembed::patiently("replace transcription", || {
+            state.db.replace_audio_transcription(
                 chunk.id,
                 &transcription,
                 &engine_name,
@@ -1813,7 +1817,8 @@ pub async fn retranscribe_handler(
                 Some(duration_secs),
                 None,
             )
-            .await
+        })
+        .await
         {
             error!(
                 "failed to update transcription for chunk {}: {}",
