@@ -337,8 +337,8 @@ pub async fn extract_frame(file_path: &str, offset_index: i64) -> Result<String>
             &filter,
             "-vframes",
             "1",
-            "-vsync",
-            "0",
+            "-fps_mode",
+            "passthrough",
             "-f",
             "image2pipe",
             "-c:v",
@@ -710,8 +710,8 @@ pub async fn extract_frames_from_video(
         "2",
         "-qmax",
         "4",
-        "-vsync",
-        "0",
+        "-fps_mode",
+        "passthrough",
         "-threads",
         "2",
         "-y",
@@ -1165,8 +1165,8 @@ pub async fn extract_frame_from_video(
             &filter,
             "-vframes",
             "1",
-            "-vsync",
-            "0",
+            "-fps_mode",
+            "passthrough",
             "-c:v",
             "mjpeg",
             "-strict",
@@ -1449,6 +1449,70 @@ mod tests {
 
         assert!(error.to_string().starts_with("VIDEO_NOT_FILE:"));
     }
+
+    /// ffmpeg 9 removed `-vsync`; every call passes `-fps_mode` instead. A
+    /// call that upstream adds with the old flag fails here, not as a 500.
+    #[test]
+    fn no_ffmpeg_call_passes_the_removed_vsync_flag() {
+        let removed = concat!("\"-vs", "ync\"");
+        for (name, source) in [
+            ("video_utils.rs", include_str!("video_utils.rs")),
+            ("video_cache.rs", include_str!("video_cache.rs")),
+            ("meeting_export.rs", include_str!("meeting_export.rs")),
+        ] {
+            assert!(!source.contains(removed), "{name} passes -vsync to ffmpeg");
+        }
+    }
+
+    /// Every frame extractor against the installed ffmpeg, on a generated
+    /// video and, when `SCREENPIPE_TEST_COMPACTED_CHUNK` names one, on a real
+    /// compacted chunk.
+    #[tokio::test]
+    async fn frame_extractors_run_under_the_installed_ffmpeg() {
+        let Some(ffmpeg) = find_ffmpeg_path() else {
+            eprintln!("skipping: ffmpeg not found");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("monitor_1_test.mp4");
+        let made = ffmpeg_cmd_async(&ffmpeg)
+            .args(["-nostdin", "-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=320x240:rate=1:duration=5")
+            .args(["-c:v", "mpeg4"])
+            .arg(&video)
+            .status()
+            .await
+            .unwrap();
+        assert!(made.success(), "ffmpeg could not make the test video");
+
+        let mut files = vec![video.to_str().unwrap().to_string()];
+        if let Ok(chunk) = std::env::var("SCREENPIPE_TEST_COMPACTED_CHUNK") {
+            files.push(chunk);
+        }
+        for file in files {
+            for offset in [0, 3] {
+                let jpeg = extract_frame(&file, offset).await.unwrap();
+                assert!(jpeg.len() > 100, "{file}#{offset}: empty frame");
+
+                let path = extract_frame_from_video(&file, offset, "10")
+                    .await
+                    .unwrap();
+                assert!(std::fs::metadata(&path).unwrap().len() > 100);
+                let _ = std::fs::remove_file(&path);
+
+                let path = extract_high_quality_frame(&file, offset, dir.path())
+                    .await
+                    .unwrap();
+                assert!(std::fs::metadata(&path).unwrap().len() > 100);
+            }
+            let frames = dir.path().join("frames");
+            std::fs::create_dir_all(&frames).unwrap();
+            extract_frames_from_video(std::path::Path::new(&file), Some(frames.clone()))
+                .await
+                .unwrap();
+            assert!(std::fs::read_dir(&frames).unwrap().next().is_some());
+        }
+    }
 }
 
 pub async fn extract_high_quality_frame(
@@ -1487,8 +1551,8 @@ pub async fn extract_high_quality_frame(
         file_path,
         "-vframes",
         "1",
-        "-vsync",
-        "0",
+        "-fps_mode",
+        "passthrough",
         "-vf",
         &filter,
         "-c:v",
