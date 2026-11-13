@@ -193,7 +193,8 @@ async fn background_audio_projects_speaker_without_per_row_lookup() {
     let projected_unnamed = unnamed.speaker.as_ref().expect("projected unnamed speaker");
     assert_eq!(projected_unnamed.id, unnamed_speaker.id);
     assert_eq!(projected_unnamed.name, "");
-    assert_eq!(projected_unnamed.metadata, "");
+    // Fork: an unnamed speaker carries the day it was first heard (patch 7).
+    assert!(projected_unnamed.metadata.starts_with(r#"{"day":""#));
     assert!(unnamed.speaker_label.is_none());
     assert_eq!(unnamed.speaker_source.as_deref(), Some("speaker_id"));
     assert!(!unnamed.speaker_provisional);

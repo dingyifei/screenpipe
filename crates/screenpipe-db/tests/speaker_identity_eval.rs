@@ -85,6 +85,7 @@ async fn speaker_identity_backfill_eval() {
             "stream-new",
             Some("stream-new:1"),
             Some("speaker 1"),
+            None,
             "A distinct guest turn.",
             base,
         )
@@ -101,6 +102,7 @@ async fn speaker_identity_backfill_eval() {
                 "other-stream",
                 Some("other-stream:1"),
                 Some("speaker 1"),
+                None,
                 text,
                 base,
             )
@@ -435,6 +437,7 @@ async fn speaker_identity_chunk_backfill_eval() {
                     stream,
                     Some(identity),
                     Some(identity),
+                    None,
                     text,
                     t,
                 )
